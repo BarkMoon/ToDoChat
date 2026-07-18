@@ -36,6 +36,11 @@ PERSONA = (
 ALLOWED_TOOLS = ["Read", "Glob", "Grep"]   # v0: read-only exploration
 TIMEOUT_SEC = 240
 
+# Models selectable per-message from the UI. Keys are what the client sends;
+# values are the --model alias the CLI accepts ("opus"/"sonnet"/"haiku").
+MODELS = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku"}
+DEFAULT_MODEL = "sonnet"
+
 
 def norm(p):
     """Normalized key for path comparison (case-insensitive on Windows)."""
@@ -102,6 +107,29 @@ def remove_project(path):
     return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"]}
 
 
+def browse_folder():
+    """Pop up a native Windows folder picker on the server machine and return
+    the chosen absolute path. Only meaningful for a local single-user app —
+    the dialog appears on whoever's screen is running the server process."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        return {"ok": False, "error": "この環境ではフォルダ選択ダイアログを表示できません。パスを直接入力してください。"}
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        path = filedialog.askdirectory(title="ToDoChat: 開発対象フォルダを選択", parent=root)
+    finally:
+        root.destroy()
+
+    if not path:
+        return {"ok": False, "cancelled": True}
+    return {"ok": True, "path": os.path.normpath(path)}
+
+
 # --- claude CLI wrapper -----------------------------------------------------
 def extract_usage(data):
     u = data.get("usage") or {}
@@ -123,16 +151,18 @@ def extract_usage(data):
     }
 
 
-def run_claude(prompt, resume=True):
+def run_claude(prompt, resume=True, model=None):
     proj = CONFIG["current"]
     if not os.path.isdir(proj):
         return {"ok": False, "error": f"作業フォルダが存在しません: {proj}"}
 
+    model_alias = MODELS.get(model, MODELS[DEFAULT_MODEL])
     cmd = [
         CLI, "-p", prompt,
         "--output-format", "json",
         "--append-system-prompt", PERSONA,
         "--allowedTools", *ALLOWED_TOOLS,
+        "--model", model_alias,
     ]
     sid = SESSIONS.get(norm(proj)) if resume else None
     if sid:
@@ -169,7 +199,7 @@ def read_tasks(d):
         return "(このフォルダに TASKS.md はありません)"
 
 
-def init_greeting():
+def init_greeting(model=None):
     proj = CONFIG["current"]
     SESSIONS.pop(norm(proj), None)   # start a fresh conversation for this folder
     if not os.path.isdir(proj):
@@ -184,7 +214,7 @@ def init_greeting():
         "(3) 他に優先すべきことがないかユーザーへ一言問いかけ\n"
         "TASKS.md が無い場合は、フォルダ内のコードやREADMEなどから状況を推測して要約してください。"
     )
-    return run_claude(prompt, resume=False)
+    return run_claude(prompt, resume=False, model=model)
 
 
 # --- HTTP handler -----------------------------------------------------------
@@ -226,19 +256,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/api/init":
-            self._send_json(init_greeting())
+            body = self._read_body()
+            self._send_json(init_greeting(model=body.get("model")))
         elif self.path == "/api/chat":
-            msg = (self._read_body().get("message") or "").strip()
+            body = self._read_body()
+            msg = (body.get("message") or "").strip()
             if not msg:
                 self._send_json({"ok": False, "error": "メッセージが空です。"})
                 return
-            self._send_json(run_claude(msg, resume=True))
+            self._send_json(run_claude(msg, resume=True, model=body.get("model")))
         elif self.path == "/api/projects/add":
             self._send_json(add_project(self._read_body().get("path")))
         elif self.path == "/api/projects/switch":
             self._send_json(switch_project(self._read_body().get("path")))
         elif self.path == "/api/projects/remove":
             self._send_json(remove_project(self._read_body().get("path")))
+        elif self.path == "/api/projects/browse":
+            self._send_json(browse_folder())
         else:
             self.send_error(404)
 

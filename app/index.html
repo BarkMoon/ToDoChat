@@ -77,6 +77,12 @@
   @keyframes blink { 0%,60%,100%{opacity:.25} 30%{opacity:1} }
 
   footer { border-top: 1px solid var(--border); padding: 12px; background: var(--panel); }
+  .modelrow { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+  .modelrow .lbl { font-size: 12px; color: var(--muted); }
+  select#model {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 4px 8px; font: inherit; font-size: 12px;
+  }
   .row { display: flex; gap: 10px; align-items: flex-end; }
   textarea {
     flex: 1; resize: none; background: var(--panel2); color: var(--text);
@@ -114,6 +120,14 @@
 
   <div id="log"></div>
   <footer>
+    <div class="modelrow">
+      <span class="lbl">モデル</span>
+      <select id="model" title="送信するメッセージに使うモデル">
+        <option value="opus">Opus（高性能）</option>
+        <option value="sonnet" selected>Sonnet（バランス）</option>
+        <option value="haiku">Haiku（高速）</option>
+      </select>
+    </div>
     <div class="row">
       <textarea id="input" placeholder="返信を入力（Enterで送信 / Shift+Enterで改行）" disabled></textarea>
       <button class="send" id="send" disabled>送信</button>
@@ -251,12 +265,22 @@ async function switchTo(path){
 projSel.addEventListener('change', () => switchTo(projSel.value));
 
 document.getElementById('addProj').addEventListener('click', async () => {
-  const path = prompt('開発対象フォルダの絶対パスを入力してください:\n（例）D:\\\\myapp');
-  if (!path) return;
-  const r = await api('/api/projects/add', { path });
-  if (!r.ok){ alert(r.error || '追加に失敗しました。'); return; }
-  await loadProjects();
-  if (r.added){ projSel.value = r.added; switchTo(r.added); }
+  const addBtn = document.getElementById('addProj');
+  addBtn.disabled = true;
+  try {
+    // Opens a native OS folder picker on the server machine (local app only).
+    const picked = await api('/api/projects/browse', {});
+    if (!picked.ok){
+      if (!picked.cancelled) alert(picked.error || 'フォルダ選択に失敗しました。');
+      return;
+    }
+    const r = await api('/api/projects/add', { path: picked.path });
+    if (!r.ok){ alert(r.error || '追加に失敗しました。'); return; }
+    await loadProjects();
+    if (r.added){ projSel.value = r.added; switchTo(r.added); }
+  } finally {
+    addBtn.disabled = false;
+  }
 });
 document.getElementById('delProj').addEventListener('click', async () => {
   const path = projSel.value;
@@ -270,11 +294,13 @@ document.getElementById('delProj').addEventListener('click', async () => {
 });
 
 // ---- init / send ----
+const modelSel = document.getElementById('model');
+
 async function init(){
   setBusy(true);
   const placeholder = typingBubble();
   try {
-    const data = await api('/api/init', {});
+    const data = await api('/api/init', { model: modelSel.value });
     placeholder.remove();
     if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); }
     else bubble('起動時の応答取得に失敗しました:\n' + (data.error || '不明なエラー'), 'err');
@@ -284,11 +310,12 @@ async function init(){
 async function send(){
   const text = input.value.trim();
   if (!text || busy) return;
+  const model = modelSel.value;   // captured at send time, per message
   input.value = ''; input.style.height = 'auto';
   bubble(text, 'user'); setBusy(true);
   const placeholder = typingBubble();
   try {
-    const data = await api('/api/chat', { message: text });
+    const data = await api('/api/chat', { message: text, model });
     placeholder.remove();
     if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); }
     else bubble(data.error || '不明なエラー', 'err');
