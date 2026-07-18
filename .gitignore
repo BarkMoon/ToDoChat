@@ -22,4 +22,7 @@ Desktop.ini
 # Logs / local runtime output
 *.log
 
+# Local per-user app state (project list / current working folder)
+projects.json
+
 # Note: TASKS.md is intentionally tracked (it is the app's task state).

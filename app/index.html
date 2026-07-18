@@ -19,40 +19,52 @@
   }
   header {
     padding: 10px 16px; border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 10px; background: var(--panel);
-    flex-wrap: wrap;
+    display: flex; align-items: center; gap: 10px; background: var(--panel); flex-wrap: wrap;
   }
   header .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); flex: none; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; flex: none; }
-  .proj {
-    font-size: 12px; color: var(--text); background: var(--panel2);
-    border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px;
-    max-width: 42vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  .projwrap { display: flex; align-items: center; gap: 6px; }
+  .projwrap .lbl { font-size: 12px; color: var(--muted); }
+  select#proj {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 8px; font: inherit; font-size: 13px; max-width: 40vw;
   }
+  .iconbtn {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; width: 30px; height: 30px; font-size: 15px; cursor: pointer; line-height: 1; padding: 0;
+  }
+  .iconbtn:hover { border-color: var(--accent); }
   .spacer { flex: 1; }
-  .stats { font-size: 12px; color: var(--muted); font-family: Consolas, "Courier New", monospace; cursor: help; }
   .status { font-size: 12px; color: var(--muted); min-width: 56px; text-align: right; }
 
+  /* token usage strip */
+  #tokstrip {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 16px; border-bottom: 1px solid var(--border); background: #14171d;
+    font-size: 12px; color: var(--muted);
+  }
+  #tokstrip .lbl { color: var(--muted); }
+  .tk-bar { flex: 1; min-width: 140px; max-width: 360px; height: 12px;
+            background: var(--code); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
+  .tk-fill { height: 100%; width: 0%; background: #3fb950; border-radius: 999px; transition: width .35s ease, background .35s ease; }
+  .tk-pct { font-family: Consolas, "Courier New", monospace; color: var(--text); min-width: 128px; }
+  .tk-cum { font-family: Consolas, "Courier New", monospace; margin-left: auto; cursor: help; }
+
   #log { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
-  .msg { max-width: 80%; padding: 12px 14px; border-radius: 12px; line-height: 1.65;
-         word-break: break-word; font-size: 14px; }
+  .msg { max-width: 80%; padding: 12px 14px; border-radius: 12px; line-height: 1.65; word-break: break-word; font-size: 14px; }
   .msg.user { background: var(--user); align-self: flex-end; border-top-right-radius: 3px; white-space: pre-wrap; }
   .msg.ai { background: var(--panel2); border: 1px solid var(--border); align-self: flex-start; border-top-left-radius: 3px; }
   .msg.sys { align-self: center; background: transparent; color: var(--muted); font-size: 12px; max-width: 90%; text-align: center; }
   .msg.err { align-self: flex-start; background: #3a1f24; border: 1px solid #5a2a30; color: #ffb4bb; white-space: pre-wrap; }
 
-  /* markdown inside AI bubbles */
-  .msg.ai > :first-child { margin-top: 0; }
-  .msg.ai > :last-child { margin-bottom: 0; }
+  .msg.ai > :first-child { margin-top: 0; } .msg.ai > :last-child { margin-bottom: 0; }
   .msg.ai p { margin: 0 0 8px; }
   .msg.ai ul, .msg.ai ol { margin: 6px 0; padding-left: 22px; }
   .msg.ai li { margin: 3px 0; }
   .msg.ai strong { color: #fff; font-weight: 700; }
   .msg.ai em { color: #d6c58a; font-style: italic; }
-  .msg.ai code { background: var(--code); border: 1px solid var(--border); border-radius: 5px;
-                 padding: 1px 5px; font-family: Consolas, "Courier New", monospace; font-size: 13px; }
-  .msg.ai pre { background: var(--code); border: 1px solid var(--border); border-radius: 8px;
-                padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
+  .msg.ai code { background: var(--code); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; font-family: Consolas, "Courier New", monospace; font-size: 13px; }
+  .msg.ai pre { background: var(--code); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
   .msg.ai pre code { background: none; border: none; padding: 0; }
   .msg.ai h2, .msg.ai h3, .msg.ai h4 { margin: 12px 0 6px; font-size: 15px; line-height: 1.4; }
   .msg.ai blockquote { border-left: 3px solid var(--accent); margin: 8px 0; padding: 2px 12px; color: var(--muted); }
@@ -72,27 +84,39 @@
     font: inherit; font-size: 14px; line-height: 1.5; max-height: 160px; min-height: 44px;
   }
   textarea:focus { outline: none; border-color: var(--accent); }
-  button {
+  button.send {
     background: var(--accent); color: #08111f; border: none; border-radius: 10px;
     padding: 0 18px; height: 44px; font-weight: 600; cursor: pointer; font-size: 14px;
   }
-  button:disabled { opacity: .5; cursor: default; }
+  button.send:disabled { opacity: .5; cursor: default; }
 </style>
 </head>
 <body>
   <header>
     <span class="dot"></span>
     <h1>ToDoChat</h1>
-    <span class="proj" id="proj" title="作業フォルダ">📁 …</span>
+    <div class="projwrap">
+      <span class="lbl">📁</span>
+      <select id="proj" title="開発対象フォルダ"></select>
+      <button class="iconbtn" id="addProj" title="フォルダを追加">＋</button>
+      <button class="iconbtn" id="delProj" title="一覧から削除（フォルダは消えません）">🗑</button>
+    </div>
     <span class="spacer"></span>
-    <span class="stats" id="stats" title="トークン使用量">—</span>
     <span class="status" id="status">起動中…</span>
   </header>
+
+  <div id="tokstrip">
+    <span class="lbl">コンテキスト使用量</span>
+    <div class="tk-bar"><div class="tk-fill" id="ctxFill"></div></div>
+    <span class="tk-pct" id="ctxPct">—</span>
+    <span class="tk-cum" id="cumTxt" title="このセッションの累計トークン使用量">累計 —</span>
+  </div>
+
   <div id="log"></div>
   <footer>
     <div class="row">
       <textarea id="input" placeholder="返信を入力（Enterで送信 / Shift+Enterで改行）" disabled></textarea>
-      <button id="send" disabled>送信</button>
+      <button class="send" id="send" disabled>送信</button>
     </div>
   </footer>
 
@@ -101,22 +125,33 @@ const log = document.getElementById('log');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const statusEl = document.getElementById('status');
-let sessionId = null;
+const projSel = document.getElementById('proj');
 let busy = false;
 
-// ---- token usage (cumulative for this session) ----
+// ---- token usage ----
 const totals = { prompt: 0, out: 0, cacheR: 0, cacheC: 0, cost: 0 };
 function fmt(n){ return n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n); }
+function barColor(pct){ return pct < 50 ? '#3fb950' : (pct < 80 ? '#d29922' : '#f85149'); }
 function addUsage(u){
   if (!u) return;
-  const inp = u.input_tokens||0, cr = u.cache_read_input_tokens||0, cc = u.cache_creation_input_tokens||0;
-  totals.prompt += inp + cr + cc;
-  totals.out += u.output_tokens||0;
-  totals.cacheR += cr; totals.cacheC += cc;
-  totals.cost += u.cost_usd||0;
-  const s = document.getElementById('stats');
-  s.textContent = `累計 ⬆${fmt(totals.prompt)} ⬇${fmt(totals.out)} · ~$${totals.cost.toFixed(3)}`;
-  s.title =
+  // context bar = this turn's prompt tokens / model context window
+  const ctx = u.context_window || 200000;
+  const pct = Math.max(0, Math.min(100, (u.prompt_tokens || 0) / ctx * 100));
+  const fill = document.getElementById('ctxFill');
+  fill.style.width = pct.toFixed(1) + '%';
+  fill.style.background = barColor(pct);
+  document.getElementById('ctxPct').textContent =
+    `${pct.toFixed(1)}%  (${fmt(u.prompt_tokens||0)} / ${fmt(ctx)})`;
+
+  // cumulative session totals
+  totals.prompt += u.prompt_tokens || 0;
+  totals.out += u.output_tokens || 0;
+  totals.cacheR += u.cache_read_input_tokens || 0;
+  totals.cacheC += u.cache_creation_input_tokens || 0;
+  totals.cost += u.cost_usd || 0;
+  const cum = document.getElementById('cumTxt');
+  cum.textContent = `累計 ⬆${fmt(totals.prompt)} ⬇${fmt(totals.out)} · ~$${totals.cost.toFixed(3)}`;
+  cum.title =
     `セッション累計トークン使用量\n` +
     `　入力(プロンプト計): ${totals.prompt.toLocaleString()}\n` +
     `　出力: ${totals.out.toLocaleString()}\n` +
@@ -124,58 +159,44 @@ function addUsage(u){
     `　推定コスト: $${totals.cost.toFixed(4)}（Proサブスクでは実課金なし・目安）\n` +
     `※Proプランの「残トークン量」はCLIから取得できないため表示できません`;
 }
+function resetContextBar(){
+  const fill = document.getElementById('ctxFill');
+  fill.style.width = '0%'; fill.style.background = '#3fb950';
+  document.getElementById('ctxPct').textContent = '—';
+}
 
 // ---- minimal, XSS-safe markdown renderer ----
-function escapeHtml(s){
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function inlineMd(s){
   s = escapeHtml(s);
   s = s.replace(/`([^`]+)`/g, (_, c) => '<code>'+c+'</code>');
-  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-                '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
   return s;
 }
 function renderMarkdown(src){
   const lines = src.split('\n');
-  const out = [];
-  let i = 0, listType = null, para = [];
+  const out = []; let i = 0, listType = null, para = [];
   const closeList = () => { if (listType){ out.push(listType==='ul'?'</ul>':'</ol>'); listType=null; } };
   const flushPara = () => { if (para.length){ out.push('<p>'+inlineMd(para.join(' '))+'</p>'); para=[]; } };
-
   while (i < lines.length){
     const line = lines[i];
-
-    const fence = line.match(/^```/);
-    if (fence){
-      flushPara(); closeList();
-      const buf = []; i++;
+    if (/^```/.test(line)){
+      flushPara(); closeList(); const buf = []; i++;
       while (i < lines.length && !/^```/.test(lines[i])){ buf.push(lines[i]); i++; }
-      i++;
-      out.push('<pre><code>'+escapeHtml(buf.join('\n'))+'</code></pre>');
-      continue;
+      i++; out.push('<pre><code>'+escapeHtml(buf.join('\n'))+'</code></pre>'); continue;
     }
     if (/^\s*$/.test(line)){ flushPara(); closeList(); i++; continue; }
-
     const h = line.match(/^(#{1,6})\s+(.*)$/);
-    if (h){ flushPara(); closeList(); const lvl = Math.min(h[1].length+1, 6);
-            out.push('<h'+lvl+'>'+inlineMd(h[2])+'</h'+lvl+'>'); i++; continue; }
-
+    if (h){ flushPara(); closeList(); const lvl = Math.min(h[1].length+1,6); out.push('<h'+lvl+'>'+inlineMd(h[2])+'</h'+lvl+'>'); i++; continue; }
     if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)){ flushPara(); closeList(); out.push('<hr>'); i++; continue; }
-
     const ul = line.match(/^\s*[-*+]\s+(.*)$/);
-    if (ul){ flushPara(); if (listType!=='ul'){ closeList(); out.push('<ul>'); listType='ul'; }
-             out.push('<li>'+inlineMd(ul[1])+'</li>'); i++; continue; }
-
+    if (ul){ flushPara(); if (listType!=='ul'){ closeList(); out.push('<ul>'); listType='ul'; } out.push('<li>'+inlineMd(ul[1])+'</li>'); i++; continue; }
     const ol = line.match(/^\s*\d+[.)]\s+(.*)$/);
-    if (ol){ flushPara(); if (listType!=='ol'){ closeList(); out.push('<ol>'); listType='ol'; }
-             out.push('<li>'+inlineMd(ol[1])+'</li>'); i++; continue; }
-
+    if (ol){ flushPara(); if (listType!=='ol'){ closeList(); out.push('<ol>'); listType='ol'; } out.push('<li>'+inlineMd(ol[1])+'</li>'); i++; continue; }
     const bq = line.match(/^>\s?(.*)$/);
     if (bq){ flushPara(); closeList(); out.push('<blockquote>'+inlineMd(bq[1])+'</blockquote>'); i++; continue; }
-
     closeList(); para.push(line); i++;
   }
   flushPara(); closeList();
@@ -186,88 +207,100 @@ function renderMarkdown(src){
 function bubble(text, cls){
   const el = document.createElement('div');
   el.className = 'msg ' + cls;
-  if (cls === 'ai') el.innerHTML = renderMarkdown(text);
-  else el.textContent = text;
-  log.appendChild(el);
-  log.scrollTop = log.scrollHeight;
-  return el;
+  if (cls === 'ai') el.innerHTML = renderMarkdown(text); else el.textContent = text;
+  log.appendChild(el); log.scrollTop = log.scrollHeight; return el;
 }
 function typingBubble(){
-  const el = document.createElement('div');
-  el.className = 'msg ai';
+  const el = document.createElement('div'); el.className = 'msg ai';
   el.innerHTML = '<span class="typing"><span></span><span></span><span></span></span>';
-  log.appendChild(el);
-  log.scrollTop = log.scrollHeight;
-  return el;
+  log.appendChild(el); log.scrollTop = log.scrollHeight; return el;
 }
 function setBusy(b){
-  busy = b; input.disabled = b; sendBtn.disabled = b;
+  busy = b; input.disabled = b; sendBtn.disabled = b; projSel.disabled = b;
   statusEl.textContent = b ? '考え中…' : '待機中';
   if (!b) input.focus();
 }
-async function callApi(path, payload){
-  const res = await fetch(path, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload || {}),
-  });
+async function api(path, payload, method){
+  const opt = { method: method || 'POST', headers: { 'Content-Type': 'application/json' } };
+  if (opt.method === 'POST') opt.body = JSON.stringify(payload || {});
+  const res = await fetch(path, opt);
   return res.json();
 }
 
-async function loadMeta(){
+// ---- projects ----
+async function loadProjects(){
   try {
-    const res = await fetch('/api/meta');
-    const m = await res.json();
-    const p = document.getElementById('proj');
-    p.textContent = '📁 ' + (m.project || '(不明)');
-    p.title = m.path || '';
-  } catch (_) { /* ignore */ }
+    const data = await api('/api/projects', null, 'GET');
+    projSel.innerHTML = '';
+    (data.projects || []).forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.path; o.textContent = p.name; o.title = p.path;
+      if (p.path === data.current) o.selected = true;
+      projSel.appendChild(o);
+    });
+  } catch (_) {}
 }
+async function switchTo(path){
+  setBusy(true);
+  const r = await api('/api/projects/switch', { path });
+  if (!r.ok){ bubble(r.error || '切替に失敗しました。', 'err'); setBusy(false); return; }
+  log.innerHTML = '';            // clear chat for the new project
+  resetContextBar();
+  await init();                  // greet for the new project
+}
+projSel.addEventListener('change', () => switchTo(projSel.value));
 
+document.getElementById('addProj').addEventListener('click', async () => {
+  const path = prompt('開発対象フォルダの絶対パスを入力してください:\n（例）D:\\\\myapp');
+  if (!path) return;
+  const r = await api('/api/projects/add', { path });
+  if (!r.ok){ alert(r.error || '追加に失敗しました。'); return; }
+  await loadProjects();
+  if (r.added){ projSel.value = r.added; switchTo(r.added); }
+});
+document.getElementById('delProj').addEventListener('click', async () => {
+  const path = projSel.value;
+  const name = projSel.options[projSel.selectedIndex] ? projSel.options[projSel.selectedIndex].textContent : path;
+  if (!confirm(`「${name}」を一覧から削除しますか？\n（フォルダ自体は削除されません）`)) return;
+  const r = await api('/api/projects/remove', { path });
+  if (!r.ok){ alert(r.error || '削除に失敗しました。'); return; }
+  await loadProjects();
+  log.innerHTML = ''; resetContextBar();
+  await init();
+});
+
+// ---- init / send ----
 async function init(){
   setBusy(true);
   const placeholder = typingBubble();
   try {
-    const data = await callApi('/api/init', {});
+    const data = await api('/api/init', {});
     placeholder.remove();
-    if (data.ok){ sessionId = data.session_id; addUsage(data.usage); bubble(data.reply, 'ai'); }
+    if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); }
     else bubble('起動時の応答取得に失敗しました:\n' + (data.error || '不明なエラー'), 'err');
-  } catch (e){
-    placeholder.remove();
-    bubble('サーバに接続できませんでした: ' + e, 'err');
-  }
+  } catch (e){ placeholder.remove(); bubble('サーバに接続できませんでした: ' + e, 'err'); }
   setBusy(false);
 }
-
 async function send(){
   const text = input.value.trim();
   if (!text || busy) return;
   input.value = ''; input.style.height = 'auto';
-  bubble(text, 'user');
-  setBusy(true);
+  bubble(text, 'user'); setBusy(true);
   const placeholder = typingBubble();
   try {
-    const data = await callApi('/api/chat', { message: text, session_id: sessionId });
+    const data = await api('/api/chat', { message: text });
     placeholder.remove();
-    if (data.ok){ if (data.session_id) sessionId = data.session_id; addUsage(data.usage); bubble(data.reply, 'ai'); }
+    if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); }
     else bubble(data.error || '不明なエラー', 'err');
-  } catch (e){
-    placeholder.remove();
-    bubble('通信エラー: ' + e, 'err');
-  }
+  } catch (e){ placeholder.remove(); bubble('通信エラー: ' + e, 'err'); }
   setBusy(false);
 }
 
-input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
-});
-input.addEventListener('input', () => {
-  input.style.height = 'auto';
-  input.style.height = Math.min(input.scrollHeight, 160) + 'px';
-});
+input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
+input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
 sendBtn.addEventListener('click', send);
 
-loadMeta();
-init();
+(async () => { await loadProjects(); await init(); })();
 </script>
 </body>
 </html>

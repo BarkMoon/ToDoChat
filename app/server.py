@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ToDoChat — minimal local web prototype (Pattern A: wraps the headless claude CLI).
+"""ToDoChat — local web prototype (Pattern A: wraps the headless claude CLI).
 
 Python standard library only. Spawns the `claude` CLI in non-interactive (-p) mode
 using the Pro subscription auth, so there is no per-token API billing.
+
+The "working folder" (the app being developed) is switchable at runtime; the list
+of folders is persisted to projects.json next to this app.
 """
 import json
 import os
@@ -13,15 +16,14 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-# --- config -----------------------------------------------------------------
+# --- paths / config ---------------------------------------------------------
 HOST = "127.0.0.1"
 PORT = 8765
 APP_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = APP_DIR.parent            # D:\seisaku\ToDoChat  (claude runs here)
-TASKS_FILE = PROJECT_DIR / "TASKS.md"
+APP_HOME = APP_DIR.parent                 # ToDoChat install dir (default project)
+CONFIG_FILE = APP_HOME / "projects.json"  # persisted project list (gitignored)
 
-# The headless CLI is installed at ~/.local/bin and is NOT on PATH, so use the
-# full path. Fall back to a bare "claude" if that ever changes.
+# The headless CLI is installed at ~/.local/bin and is NOT on PATH -> full path.
 _NATIVE = Path(os.environ.get("USERPROFILE", "")) / ".local" / "bin" / "claude.exe"
 CLI = str(_NATIVE) if _NATIVE.exists() else "claude"
 
@@ -31,25 +33,113 @@ PERSONA = (
     "常に日本語で、要点を先に、簡潔に答えます。"
     "先回りして次の具体的なアクションを1つ提案してください。"
 )
-# v0 is advisory / read-only. Editing (Edit/Write/Bash) is a later step.
-ALLOWED_TOOLS = ["Read", "Glob", "Grep"]
+ALLOWED_TOOLS = ["Read", "Glob", "Grep"]   # v0: read-only exploration
 TIMEOUT_SEC = 240
 
+
+def norm(p):
+    """Normalized key for path comparison (case-insensitive on Windows)."""
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def save_config(cfg):
+    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if cfg.get("projects") and cfg.get("current"):
+                return cfg
+        except (ValueError, OSError):
+            pass
+    default = {
+        "current": str(APP_HOME),
+        "projects": [{"path": str(APP_HOME), "name": APP_HOME.name}],
+    }
+    save_config(default)
+    return default
+
+
+CONFIG = load_config()
+SESSIONS = {}   # norm(project_path) -> claude session_id (in-memory only)
+
+
+# --- project management -----------------------------------------------------
+def list_projects():
+    return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"]}
+
+
+def add_project(path):
+    p = os.path.abspath(os.path.expanduser((path or "").strip().strip('"')))
+    if not p or not os.path.isdir(p):
+        return {"ok": False, "error": f"フォルダが見つかりません: {p or '(空)'}"}
+    if not any(norm(x["path"]) == norm(p) for x in CONFIG["projects"]):
+        CONFIG["projects"].append({"path": p, "name": os.path.basename(p) or p})
+        save_config(CONFIG)
+    return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"], "added": p}
+
+
+def switch_project(path):
+    match = next((x for x in CONFIG["projects"] if norm(x["path"]) == norm(path or "")), None)
+    if not match:
+        return {"ok": False, "error": "一覧にないフォルダです。"}
+    CONFIG["current"] = match["path"]
+    save_config(CONFIG)
+    return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"]}
+
+
+def remove_project(path):
+    key = norm(path or "")
+    CONFIG["projects"] = [x for x in CONFIG["projects"] if norm(x["path"]) != key]
+    if not CONFIG["projects"]:
+        CONFIG["projects"] = [{"path": str(APP_HOME), "name": APP_HOME.name}]
+    if norm(CONFIG["current"]) == key:
+        CONFIG["current"] = CONFIG["projects"][0]["path"]
+    SESSIONS.pop(key, None)
+    save_config(CONFIG)
+    return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"]}
+
+
 # --- claude CLI wrapper -----------------------------------------------------
-def run_claude(prompt, session_id=None):
+def extract_usage(data):
+    u = data.get("usage") or {}
+    inp = u.get("input_tokens", 0) or 0
+    cr = u.get("cache_read_input_tokens", 0) or 0
+    cc = u.get("cache_creation_input_tokens", 0) or 0
+    out = u.get("output_tokens", 0) or 0
+    ctx = 0
+    for v in (data.get("modelUsage") or {}).values():
+        ctx = max(ctx, v.get("contextWindow", 0) or 0)
+    return {
+        "input_tokens": inp,
+        "output_tokens": out,
+        "cache_read_input_tokens": cr,
+        "cache_creation_input_tokens": cc,
+        "prompt_tokens": inp + cr + cc,      # size of this turn's prompt (context used)
+        "context_window": ctx or 200000,
+        "cost_usd": data.get("total_cost_usd", 0) or 0,
+    }
+
+
+def run_claude(prompt, resume=True):
+    proj = CONFIG["current"]
+    if not os.path.isdir(proj):
+        return {"ok": False, "error": f"作業フォルダが存在しません: {proj}"}
+
     cmd = [
         CLI, "-p", prompt,
         "--output-format", "json",
         "--append-system-prompt", PERSONA,
         "--allowedTools", *ALLOWED_TOOLS,
     ]
-    if session_id:
-        cmd += ["--resume", session_id]
+    sid = SESSIONS.get(norm(proj)) if resume else None
+    if sid:
+        cmd += ["--resume", sid]
+
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(PROJECT_DIR),
-            capture_output=True, timeout=TIMEOUT_SEC,
-        )
+        proc = subprocess.run(cmd, cwd=proj, capture_output=True, timeout=TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "応答がタイムアウトしました。もう一度お試しください。"}
     except FileNotFoundError:
@@ -65,38 +155,36 @@ def run_claude(prompt, session_id=None):
         return {"ok": False, "error": f"応答の解析に失敗しました。\n{out[:500]}"}
     if data.get("is_error"):
         return {"ok": False, "error": data.get("result") or "エラーが発生しました。"}
-    u = data.get("usage") or {}
-    return {
-        "ok": True,
-        "reply": data.get("result", ""),
-        "session_id": data.get("session_id"),
-        "usage": {
-            "input_tokens": u.get("input_tokens", 0),
-            "output_tokens": u.get("output_tokens", 0),
-            "cache_read_input_tokens": u.get("cache_read_input_tokens", 0),
-            "cache_creation_input_tokens": u.get("cache_creation_input_tokens", 0),
-            "cost_usd": data.get("total_cost_usd", 0) or 0,
-        },
-    }
+
+    new_sid = data.get("session_id")
+    if new_sid:
+        SESSIONS[norm(proj)] = new_sid
+    return {"ok": True, "reply": data.get("result", ""), "usage": extract_usage(data)}
 
 
-def read_tasks():
+def read_tasks(d):
     try:
-        return TASKS_FILE.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return "(TASKS.md が見つかりません)"
+        return (Path(d) / "TASKS.md").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return "(このフォルダに TASKS.md はありません)"
 
 
 def init_greeting():
+    proj = CONFIG["current"]
+    SESSIONS.pop(norm(proj), None)   # start a fresh conversation for this folder
+    if not os.path.isdir(proj):
+        return {"ok": False, "error": f"作業フォルダが存在しません: {proj}"}
     prompt = (
-        "以下は現在のタスク状況（TASKS.md）です:\n\n"
-        f"{read_tasks()}\n\n"
+        f"作業対象フォルダ: {proj}\n\n"
+        "以下はこのフォルダの TASKS.md の内容です:\n\n"
+        f"{read_tasks(proj)}\n\n"
         "起動時の第一声として、次の3点を短くまとめてください:\n"
         "(1) 現状のタスク状況を1〜2文で要約\n"
         "(2) 次に取り掛かるべきタスクを1つ提案\n"
-        "(3) 他に優先すべきことがないかユーザーへ一言問いかけ"
+        "(3) 他に優先すべきことがないかユーザーへ一言問いかけ\n"
+        "TASKS.md が無い場合は、フォルダ内のコードやREADMEなどから状況を推測して要約してください。"
     )
-    return run_claude(prompt)
+    return run_claude(prompt, resume=False)
 
 
 # --- HTTP handler -----------------------------------------------------------
@@ -119,8 +207,8 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self):
-        if self.path == "/api/meta":
-            self._send_json({"project": PROJECT_DIR.name, "path": str(PROJECT_DIR)})
+        if self.path == "/api/projects":
+            self._send_json(list_projects())
             return
         if self.path in ("/", "/index.html"):
             try:
@@ -140,12 +228,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/init":
             self._send_json(init_greeting())
         elif self.path == "/api/chat":
-            body = self._read_body()
-            msg = (body.get("message") or "").strip()
+            msg = (self._read_body().get("message") or "").strip()
             if not msg:
                 self._send_json({"ok": False, "error": "メッセージが空です。"})
                 return
-            self._send_json(run_claude(msg, session_id=body.get("session_id")))
+            self._send_json(run_claude(msg, resume=True))
+        elif self.path == "/api/projects/add":
+            self._send_json(add_project(self._read_body().get("path")))
+        elif self.path == "/api/projects/switch":
+            self._send_json(switch_project(self._read_body().get("path")))
+        elif self.path == "/api/projects/remove":
+            self._send_json(remove_project(self._read_body().get("path")))
         else:
             self.send_error(404)
 
@@ -167,7 +260,7 @@ def main():
         return
     print(f"ToDoChat running at {url}")
     print(f"  CLI     : {CLI}")
-    print(f"  project : {PROJECT_DIR}")
+    print(f"  current : {CONFIG['current']}")
     print("Press Ctrl+C to stop.")
     threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
