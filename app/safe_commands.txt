@@ -24,8 +24,13 @@
 # [commands]
 # git 以外の、単体で読み取り専用のコマンド（出力は標準出力のみ。ファイルへの
 # 書き込みはリダイレクトが必要＝自動許可されない）。
-# 他プログラムを実行できるもの(env, xargs, find, sudo, watch, time ...)や、
+# 他プログラムを実行できるもの(env, xargs, sudo, watch, time ...)や、
 # ファイルを書き換えるもの(sed -i, tee, cp, mv, rm, touch ...)は載せないこと。
+# 注: find は -exec/-delete 等で書込・他プログラム実行が可能なため単純には載せず、
+#     safe_shell.py 側の専用ガード(_find_safe)で「書込・実行系プリミティブを
+#     含まない読み取り専用の find」だけを自動許可している。ここには載せないこと。
+# 注: 2>/dev/null や 2>&1 等の「捨てる/合流」リダイレクトは safe_shell.py が
+#     無害として除去するので、これらが付いていても自動許可の対象になる。
 [commands]
 echo
 printf
@@ -37,6 +42,7 @@ tac
 ls
 dir
 pwd
+cd
 tree
 wc
 sort
