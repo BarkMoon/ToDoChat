@@ -204,6 +204,30 @@ def clear_history(proj):
     return {"ok": True, "cleared_memory": had}
 
 
+def get_memory(proj):
+    """Return the current project's hand-off note for the viewer/editor UI."""
+    return {"ok": True, "memory": read_memory(proj), "exists": memory_path(proj).exists()}
+
+
+def write_memory(proj, text):
+    """Manual edit save from the editor UI. Backs the old note up to TRASH first
+    (same as every other overwrite/delete path), then writes the new text -- or
+    deletes the note entirely when the text is blank, so clearing the box in the
+    editor is the natural way to remove the note."""
+    text = (text or "").strip()
+    backup_memory(proj)
+    p = memory_path(proj)
+    try:
+        if text:
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+        elif p.exists():
+            p.unlink()
+    except OSError as e:
+        return {"ok": False, "error": f"保存に失敗しました: {e}"}
+    return {"ok": True, "memory": read_memory(proj), "exists": bool(text)}
+
+
 # /remember: force a manual snapshot of the current session into the memory note
 # now, regardless of whether the AI judged the state worth saving on its own. We
 # resume the live session so the summary reflects the actual conversation, ask
@@ -745,6 +769,12 @@ class Handler(BaseHTTPRequestHandler):
             # session into the memory note now (streamed like a normal turn).
             body = self._read_body()
             self._stream_ndjson(remember_stream(model=body.get("model")))
+        elif self.path == "/api/memory/get":
+            # Memory-editor modal opened: return the current project's note.
+            self._send_json(get_memory(CONFIG["current"]))
+        elif self.path == "/api/memory/save":
+            # Memory-editor 保存/削除: overwrite (or clear) the note by hand.
+            self._send_json(write_memory(CONFIG["current"], self._read_body().get("text")))
         elif self.path == "/api/clear":
             # /clear typed in chat: drop the live session + delete the memory
             # note for the current project (a backup is kept in TRASH first).

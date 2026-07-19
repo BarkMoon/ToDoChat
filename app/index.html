@@ -130,6 +130,52 @@
     padding: 0 18px; height: 44px; font-weight: 600; cursor: pointer; font-size: 14px;
   }
   button.send:disabled { opacity: .5; cursor: default; }
+
+  /* memory-log viewer / editor modal */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 50;
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .modal-overlay[hidden] { display: none; }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    width: 100%; max-width: 560px; max-height: 90vh; display: flex; flex-direction: column;
+    box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  }
+  .modal-head {
+    display: flex; align-items: center; gap: 10px; padding: 13px 16px;
+    border-bottom: 1px solid var(--border); font-size: 15px; font-weight: 600;
+  }
+  .modal-head .spacer { flex: 1; }
+  .modal-desc { padding: 12px 16px 0; font-size: 12px; color: var(--muted); line-height: 1.55; }
+  .modal-desc b { color: var(--text); font-weight: 600; }
+  #memText {
+    margin: 12px 16px; flex: 1; min-height: 220px; resize: vertical;
+    background: var(--code); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px; font-family: Consolas, "Courier New", monospace;
+    font-size: 13px; line-height: 1.6;
+  }
+  #memText:focus { outline: none; border-color: var(--accent); }
+  #memText:disabled { opacity: .6; }
+  .modal-actions {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    border-top: 1px solid var(--border);
+  }
+  .modal-actions .spacer { flex: 1; }
+  .mem-status { font-size: 12px; color: var(--muted); }
+  .mem-status.ok { color: #7ee0a0; }
+  .mem-status.err { color: #ffb4bb; }
+  .btn-primary {
+    background: var(--accent); color: #08111f; border: none; border-radius: 8px;
+    padding: 8px 18px; font: inherit; font-weight: 600; font-size: 13px; cursor: pointer;
+  }
+  .btn-primary:disabled { opacity: .5; cursor: default; }
+  .btn-danger {
+    background: #3a1f24; color: #ffd7db; border: 1px solid #5a2a30; border-radius: 8px;
+    padding: 8px 14px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  .btn-danger:hover { border-color: #f85149; }
+  .btn-danger:disabled { opacity: .5; cursor: default; }
 </style>
 </head>
 <body>
@@ -141,6 +187,7 @@
       <select id="proj" title="開発対象フォルダ"></select>
       <button class="iconbtn" id="addProj" title="フォルダを追加">＋</button>
       <button class="iconbtn" id="delProj" title="一覧から削除（フォルダは消えません）">🗑</button>
+      <button class="iconbtn" id="memBtn" title="記憶ログ（引き継ぎメモ）を表示・編集">🧠</button>
     </div>
     <span class="spacer"></span>
     <div class="modewrap">
@@ -176,6 +223,27 @@
       <button class="send" id="send" disabled>送信</button>
     </div>
   </footer>
+
+  <div id="memModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <span>🧠 記憶ログ（引き継ぎメモ）</span>
+        <span class="spacer"></span>
+        <button class="iconbtn" id="memClose" title="閉じる">✕</button>
+      </div>
+      <div class="modal-desc">
+        <b id="memProj">—</b> の記憶ログです。<b>アプリ再起動後の第一声</b>でAIに引き継がれます。
+        自由に編集できます。<b>空にして保存すると削除</b>されます（バックアップは <code>.todochat/trash</code> に保持）。
+      </div>
+      <textarea id="memText" placeholder="（このフォルダの記憶ログはまだありません）" spellcheck="false"></textarea>
+      <div class="modal-actions">
+        <button class="btn-danger" id="memDelete">削除</button>
+        <span class="spacer"></span>
+        <span class="mem-status" id="memStatus"></span>
+        <button class="btn-primary" id="memSave">保存</button>
+      </div>
+    </div>
+  </div>
 
 <script>
 const log = document.getElementById('log');
@@ -386,6 +454,7 @@ async function loadProjects(){
   } catch (_) {}
 }
 async function switchTo(path){
+  closeMemory();                 // don't leave a stale note open across a switch
   setBusy(true);
   const r = await api('/api/projects/switch', { path });
   if (!r.ok){ bubble(r.error || '切替に失敗しました。', 'err'); setBusy(false); return; }
@@ -535,6 +604,53 @@ async function rememberSnapshot(){
   }
   setBusy(false);
 }
+// ---- memory-log viewer / editor (🧠 button) ----
+// Read/edit the current project's cross-restart hand-off note by hand. Saving
+// backs the old note up to .todochat/trash first (server side); clearing the box
+// and saving deletes the note. Edits take effect on the NEXT launch's greeting,
+// not the live conversation (the note is a restart hand-off, not chat context).
+const memModal = document.getElementById('memModal');
+const memText = document.getElementById('memText');
+const memStatus = document.getElementById('memStatus');
+const memSaveBtn = document.getElementById('memSave');
+const memDelBtn = document.getElementById('memDelete');
+function setMemStatus(msg, cls){ memStatus.className = 'mem-status' + (cls ? ' ' + cls : ''); memStatus.textContent = msg || ''; }
+function memBusy(b){ memText.disabled = b; memSaveBtn.disabled = b; memDelBtn.disabled = b; }
+async function openMemory(){
+  const opt = projSel.options[projSel.selectedIndex];
+  document.getElementById('memProj').textContent = opt ? opt.textContent : '現在のフォルダ';
+  memText.value = ''; setMemStatus('読み込み中…'); memBusy(true);
+  memModal.hidden = false;
+  try {
+    const r = await api('/api/memory/get', {});
+    if (r.ok){ memText.value = r.memory || ''; setMemStatus(r.exists ? '' : '（まだ記憶ログはありません）'); }
+    else setMemStatus(r.error || '読み込みに失敗しました', 'err');
+  } catch(e){ setMemStatus('読み込みに失敗: ' + e, 'err'); }
+  memBusy(false); memText.focus();
+}
+function closeMemory(){ memModal.hidden = true; }
+async function saveMemory(){
+  memBusy(true); setMemStatus('保存中…');
+  try {
+    const r = await api('/api/memory/save', { text: memText.value });
+    if (r.ok){ memText.value = r.memory || ''; setMemStatus(r.exists ? '✓ 保存しました' : '✓ 空のため削除しました', 'ok'); }
+    else setMemStatus(r.error || '保存に失敗しました', 'err');
+  } catch(e){ setMemStatus('保存に失敗: ' + e, 'err'); }
+  memBusy(false);
+}
+async function deleteMemory(){
+  if (!memText.value.trim()){ closeMemory(); return; }
+  if (!confirm('この記憶ログを削除しますか？\n（バックアップは .todochat/trash に保持されます）')) return;
+  memText.value = '';
+  await saveMemory();
+}
+document.getElementById('memBtn').addEventListener('click', openMemory);
+document.getElementById('memClose').addEventListener('click', closeMemory);
+memSaveBtn.addEventListener('click', saveMemory);
+memDelBtn.addEventListener('click', deleteMemory);
+memModal.addEventListener('click', (e) => { if (e.target === memModal) closeMemory(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !memModal.hidden) closeMemory(); });
+
 async function send(){
   const text = input.value.trim();
   if (!text || busy) return;
