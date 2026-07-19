@@ -307,6 +307,27 @@ async function api(path, payload, method){
   return res.json();
 }
 
+// Streams newline-delimited JSON events from the server as they arrive
+// (real-time reply text) and calls onEvent for each parsed line.
+async function apiStream(path, payload, onEvent){
+  const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload || {}) });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  while (true){
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0){
+      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+      if (!line.trim()) continue;
+      try { onEvent(JSON.parse(line)); } catch (_) {}
+    }
+  }
+  if (buf.trim()){ try { onEvent(JSON.parse(buf)); } catch (_) {} }
+}
+
 // ---- projects ----
 async function loadProjects(){
   try {
@@ -362,15 +383,40 @@ document.getElementById('delProj').addEventListener('click', async () => {
 // ---- init / send ----
 const modelSel = document.getElementById('model');
 
+// Drives one streamed request: shows typing dots until the first text chunk
+// arrives, then grows the bubble with live text, then swaps in the fully
+// rendered Markdown once the final result event lands.
+async function streamedTurn(path, payload, onFail){
+  const el = typingBubble();
+  let acc = '', started = false, final = null;
+  try {
+    await apiStream(path, payload, (ev) => {
+      if (ev.type === 'delta'){
+        if (!started){ el.innerHTML = ''; started = true; }
+        acc += ev.text;
+        el.textContent = acc;
+        log.scrollTop = log.scrollHeight;
+      } else if (ev.type === 'final'){
+        final = ev;
+      }
+    });
+  } catch (e){
+    el.remove(); onFail('通信エラー: ' + e); return;
+  }
+  if (final && final.ok){
+    el.innerHTML = renderMarkdown(final.reply || acc);
+    log.scrollTop = log.scrollHeight;
+    addUsage(final.usage);
+    showDenials(final.usage && final.usage.permission_denials);
+  } else {
+    el.remove();
+    onFail((final && final.error) || '不明なエラー');
+  }
+}
 async function init(){
   setBusy(true);
-  const placeholder = typingBubble();
-  try {
-    const data = await api('/api/init', { model: modelSel.value, mode: currentMode() });
-    placeholder.remove();
-    if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); showDenials(data.usage && data.usage.permission_denials); }
-    else bubble('起動時の応答取得に失敗しました:\n' + (data.error || '不明なエラー'), 'err');
-  } catch (e){ placeholder.remove(); bubble('サーバに接続できませんでした: ' + e, 'err'); }
+  await streamedTurn('/api/init', { model: modelSel.value, mode: currentMode() },
+    (msg) => bubble('起動時の応答取得に失敗しました:\n' + msg, 'err'));
   setBusy(false);
 }
 async function send(){
@@ -380,13 +426,7 @@ async function send(){
   const mode = currentMode();
   input.value = ''; input.style.height = 'auto';
   bubble(text, 'user'); setBusy(true);
-  const placeholder = typingBubble();
-  try {
-    const data = await api('/api/chat', { message: text, model, mode });
-    placeholder.remove();
-    if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); showDenials(data.usage && data.usage.permission_denials); }
-    else bubble(data.error || '不明なエラー', 'err');
-  } catch (e){ placeholder.remove(); bubble('通信エラー: ' + e, 'err'); }
+  await streamedTurn('/api/chat', { message: text, model, mode }, (msg) => bubble(msg, 'err'));
   setBusy(false);
 }
 

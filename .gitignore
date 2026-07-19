@@ -25,4 +25,7 @@ Desktop.ini
 # Local per-user app state (project list / current working folder)
 projects.json
 
+# Dedicated Chromium profile for the app-window launcher (server.py)
+/.browser-profile/
+
 # Note: TASKS.md is intentionally tracked (it is the app's task state).

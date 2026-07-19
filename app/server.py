@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -178,16 +179,22 @@ def extract_usage(data):
     }
 
 
-def run_claude(prompt, resume=True, model=None, mode=None):
+def run_claude_stream(prompt, resume=True, model=None, mode=None):
+    """Generator: yields {"type":"delta","text":...} chunks as the reply is
+    generated, then exactly one {"type":"final", ok:..., reply/error, usage}
+    event with the same shape the UI previously got from a single JSON call."""
     proj = CONFIG["current"]
     if not os.path.isdir(proj):
-        return {"ok": False, "error": f"作業フォルダが存在しません: {proj}"}
+        yield {"type": "final", "ok": False, "error": f"作業フォルダが存在しません: {proj}"}
+        return
 
     model_alias = MODELS.get(model, MODELS[DEFAULT_MODEL])
     edit_mode = mode == "edit"
     cmd = [
         CLI, "-p", prompt,
-        "--output-format", "json",
+        "--output-format", "stream-json",
+        "--include-partial-messages",
+        "--verbose",
         "--append-system-prompt", PERSONA,
         "--allowedTools", *(EDIT_TOOLS if edit_mode else ADVISORY_TOOLS),
         "--model", model_alias,
@@ -203,27 +210,64 @@ def run_claude(prompt, resume=True, model=None, mode=None):
         cmd += ["--resume", sid]
 
     try:
-        proc = subprocess.run(cmd, cwd=proj, capture_output=True, timeout=TIMEOUT_SEC, env=env)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "応答がタイムアウトしました。もう一度お試しください。"}
+        # stderr is merged into stdout: reading only one pipe avoids the
+        # classic subprocess deadlock (child blocks on a full stderr buffer
+        # while we're only draining stdout). Stray non-JSON lines are just
+        # skipped below.
+        proc = subprocess.Popen(
+            cmd, cwd=proj, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
     except FileNotFoundError:
-        return {"ok": False, "error": f"claude CLI が見つかりません: {CLI}"}
+        yield {"type": "final", "ok": False, "error": f"claude CLI が見つかりません: {CLI}"}
+        return
 
-    out = proc.stdout.decode("utf-8", errors="replace").strip()
-    if not out:
-        err = proc.stderr.decode("utf-8", errors="replace").strip()
-        return {"ok": False, "error": f"CLIから応答がありませんでした。\n{err[:500]}"}
+    timed_out = {"hit": False}
+
+    def _kill_on_timeout():
+        timed_out["hit"] = True
+        proc.kill()
+
+    timer = threading.Timer(TIMEOUT_SEC, _kill_on_timeout)
+    timer.start()
+    result_data = None
     try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": f"応答の解析に失敗しました。\n{out[:500]}"}
-    if data.get("is_error"):
-        return {"ok": False, "error": data.get("result") or "エラーが発生しました。"}
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = d.get("type")
+            if t == "stream_event":
+                ev = d.get("event") or {}
+                if ev.get("type") == "content_block_delta":
+                    delta = ev.get("delta") or {}
+                    if delta.get("type") == "text_delta" and delta.get("text"):
+                        yield {"type": "delta", "text": delta["text"]}
+            elif t == "result":
+                result_data = d
+    finally:
+        timer.cancel()
+        proc.wait()
 
-    new_sid = data.get("session_id")
+    if timed_out["hit"]:
+        yield {"type": "final", "ok": False, "error": "応答がタイムアウトしました。もう一度お試しください。"}
+        return
+    if result_data is None:
+        yield {"type": "final", "ok": False, "error": "CLIから応答がありませんでした。"}
+        return
+    if result_data.get("is_error"):
+        yield {"type": "final", "ok": False, "error": result_data.get("result") or "エラーが発生しました。"}
+        return
+
+    new_sid = result_data.get("session_id")
     if new_sid:
         SESSIONS[norm(proj)] = new_sid
-    return {"ok": True, "reply": data.get("result", ""), "usage": extract_usage(data)}
+    yield {"type": "final", "ok": True, "reply": result_data.get("result", ""), "usage": extract_usage(result_data)}
 
 
 def read_tasks(d):
@@ -233,11 +277,12 @@ def read_tasks(d):
         return "(このフォルダに TASKS.md はありません)"
 
 
-def init_greeting(model=None, mode=None):
+def init_greeting_stream(model=None, mode=None):
     proj = CONFIG["current"]
     SESSIONS.pop(norm(proj), None)   # start a fresh conversation for this folder
     if not os.path.isdir(proj):
-        return {"ok": False, "error": f"作業フォルダが存在しません: {proj}"}
+        yield {"type": "final", "ok": False, "error": f"作業フォルダが存在しません: {proj}"}
+        return
     prompt = (
         f"作業対象フォルダ: {proj}\n\n"
         "以下はこのフォルダの TASKS.md の内容です:\n\n"
@@ -248,7 +293,7 @@ def init_greeting(model=None, mode=None):
         "(3) 他に優先すべきことがないかユーザーへ一言問いかけ\n"
         "TASKS.md が無い場合は、フォルダ内のコードやREADMEなどから状況を推測して要約してください。"
     )
-    return run_claude(prompt, resume=False, model=model, mode=mode)
+    yield from run_claude_stream(prompt, resume=False, model=model, mode=mode)
 
 
 # --- HTTP handler -----------------------------------------------------------
@@ -269,6 +314,22 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError, json.JSONDecodeError):
             return {}
+
+    def _stream_ndjson(self, events):
+        """Stream a generator of dicts to the client as newline-delimited JSON,
+        flushing after each one so the browser sees deltas as they're produced."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            for ev in events:
+                self.wfile.write((json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass  # client navigated away / closed the tab mid-stream
 
     def do_GET(self):
         if self.path == "/api/projects":
@@ -291,14 +352,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/init":
             body = self._read_body()
-            self._send_json(init_greeting(model=body.get("model"), mode=body.get("mode")))
+            self._stream_ndjson(init_greeting_stream(model=body.get("model"), mode=body.get("mode")))
         elif self.path == "/api/chat":
             body = self._read_body()
             msg = (body.get("message") or "").strip()
             if not msg:
                 self._send_json({"ok": False, "error": "メッセージが空です。"})
                 return
-            self._send_json(run_claude(msg, resume=True, model=body.get("model"), mode=body.get("mode")))
+            self._stream_ndjson(run_claude_stream(msg, resume=True, model=body.get("model"), mode=body.get("mode")))
         elif self.path == "/api/projects/add":
             self._send_json(add_project(self._read_body().get("path")))
         elif self.path == "/api/projects/switch":
@@ -314,6 +375,54 @@ class Handler(BaseHTTPRequestHandler):
         pass  # keep the console quiet
 
 
+# --add-dir candidates for a Chromium browser's --app= "site as a window" mode
+# (no tabs/address bar), so ToDoChat can't get lost among other browser tabs.
+_APP_BROWSER_CANDIDATES = [
+    r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+    r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+    r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+    r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+    r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+]
+
+
+# Dedicated Chromium profile for ToDoChat's app window. --app mode only opens
+# a separate tab-less window when it's a distinct profile/instance -- reusing
+# the user's normal Edge/Chrome profile just opens a new tab in whatever
+# browser window is already running (tested: verified this actually happens).
+APP_PROFILE_DIR = APP_HOME / ".browser-profile"
+
+
+def find_app_browser():
+    for c in _APP_BROWSER_CANDIDATES:
+        p = os.path.expandvars(c)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def open_app_window(url):
+    """Open ToDoChat as its own window (no tabs/URL bar) via Edge/Chrome --app
+    mode in a dedicated profile, so it can't get buried among the user's other
+    browser tabs. Falls back to a normal tab if no Chromium browser is found."""
+    browser = find_app_browser()
+    if browser:
+        subprocess.Popen([
+            browser, f"--app={url}",
+            f"--user-data-dir={APP_PROFILE_DIR}",
+            # Keep this a clean, isolated app instance. Without these, Edge
+            # signs the profile into the Windows account and syncs the user's
+            # extensions (Grammarly, etc.), each of which pops its own welcome
+            # tab -- unwanted noise every launch. Disable extensions + sync so
+            # only the ToDoChat window opens.
+            "--disable-extensions", "--disable-sync",
+            "--no-first-run", "--no-default-browser-check",
+            "--window-size=480,880",
+        ])
+    else:
+        webbrowser.open(url)
+
+
 def main():
     url = f"http://{HOST}:{PORT}/"
     # Reject a duplicate launch loudly instead of silently co-binding the port
@@ -323,14 +432,14 @@ def main():
         server = ThreadingHTTPServer((HOST, PORT), Handler)
     except OSError:
         print(f"ポート {PORT} は使用中です。ToDoChat は既に起動している可能性があります。")
-        print(f"ブラウザで {url} を開いてください。")
-        webbrowser.open(url)
+        print(f"ウィンドウが見当たらない場合は {url} を開いてください。")
+        open_app_window(url)
         return
     print(f"ToDoChat running at {url}")
     print(f"  CLI     : {CLI}")
     print(f"  current : {CONFIG['current']}")
     print("Press Ctrl+C to stop.")
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    threading.Timer(0.8, lambda: open_app_window(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
