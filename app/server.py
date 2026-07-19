@@ -8,9 +8,12 @@ using the Pro subscription auth, so there is no per-token API billing.
 The "working folder" (the app being developed) is switchable at runtime; the list
 of folders is persisted to projects.json next to this app.
 """
+import hashlib
 import json
 import os
 import queue
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -39,6 +42,14 @@ PERSONA = (
     "ユーザーが隙間時間に即座に開発へ取り掛かれるよう支援します。"
     "常に日本語で、要点を先に、簡潔に答えます。"
     "先回りして次の具体的なアクションを1つ提案してください。"
+    "\n\n【記憶ログ】アプリ再起動後も引き継ぐべき『進行中タスクの状態・決定事項・"
+    "次の一手・重要なパスや事実』がある場合に限り、返信の一番最後に次の形式の"
+    "記憶ブロックを1つだけ付けてください（引き継ぐことが無ければ付けない）:\n"
+    "[[TODOCHAT_MEMORY]]\n"
+    "(数行の簡潔な要約のみ。会話の全文ログは書かない。トークン節約が目的)\n"
+    "[[/TODOCHAT_MEMORY]]\n"
+    "このブロックはユーザーには表示されず、次回起動時の引き継ぎメモとして保存されます。"
+    "毎回付ける必要はなく、状況に変化があった時だけ最新の内容で上書きしてください。"
 )
 # Three modes, chosen per-message from the UI:
 #   advisory - read-only exploration, no file/shell access.
@@ -109,6 +120,86 @@ def load_config():
 
 CONFIG = load_config()
 SESSIONS = {}   # norm(project_path) -> claude session_id (in-memory only)
+
+# --- memory log (compact cross-restart hand-off note) -----------------------
+# We deliberately do NOT persist/replay the full CLI transcript across restarts
+# (that re-sends the whole history every turn -> heavy token use). Instead, the
+# AI appends a small [[TODOCHAT_MEMORY]]...[[/TODOCHAT_MEMORY]] block to a reply
+# only when there is in-progress work worth remembering; the server extracts it
+# and stores just that summary, per project. On the next launch the greeting is
+# seeded with this note (a few lines) instead of the whole conversation.
+MEMORY_DIR = APP_HOME / ".todochat" / "memory"   # active notes (server-managed, gitignored)
+TRASH_DIR = APP_HOME / ".todochat" / "trash"     # backups of deleted/overwritten notes
+MEMORY_RE = re.compile(r"\[\[TODOCHAT_MEMORY\]\](.*?)\[\[/TODOCHAT_MEMORY\]\]", re.DOTALL)
+
+
+def memory_path(proj):
+    """Per-project memory file. Named from the folder's basename plus a short
+    hash of its normalized path (readable, collision-free across folders)."""
+    n = norm(proj)
+    h = hashlib.sha1(n.encode("utf-8")).hexdigest()[:8]
+    base = os.path.basename(os.path.normpath(str(proj))) or "root"
+    safe = re.sub(r"[^\w.-]", "_", base)[:40]
+    return MEMORY_DIR / f"{safe}-{h}.md"
+
+
+def read_memory(proj):
+    try:
+        return memory_path(proj).read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def backup_memory(proj):
+    """Copy the current note into TRASH before it is overwritten or deleted.
+    TRASH is NEVER read back by the server, so these copies never re-enter a
+    prompt (zero token cost) -- they are just retained copies of deleted files,
+    kept in case the user wants to recover something."""
+    p = memory_path(proj)
+    if not p.exists():
+        return
+    try:
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+        # uuid suffix so two backups in the same second don't overwrite.
+        stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        shutil.copy2(p, TRASH_DIR / f"{p.stem}-{stamp}{p.suffix}")
+    except OSError:
+        pass
+
+
+def apply_memory_block(proj, reply_text):
+    """If a reply carries a memory block, persist its contents (backing up the
+    prior note first) and return the reply with the block stripped for display.
+    Only writes when the note actually changed, so identical re-emissions don't
+    spam TRASH."""
+    m = MEMORY_RE.search(reply_text or "")
+    if not m:
+        return reply_text
+    new = m.group(1).strip()
+    if new and new != read_memory(proj):
+        backup_memory(proj)
+        try:
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            memory_path(proj).write_text(new, encoding="utf-8")
+        except OSError:
+            pass
+    return MEMORY_RE.sub("", reply_text).strip()
+
+
+def clear_history(proj):
+    """/clear: forget the live session pointer and delete this project's memory
+    note (backing it up to TRASH first). The CLI's own transcript files are left
+    on disk but are no longer referenced, so the next greeting starts fresh."""
+    SESSIONS.pop(norm(proj), None)
+    p = memory_path(proj)
+    had = p.exists()
+    backup_memory(proj)
+    try:
+        if had:
+            p.unlink()
+    except OSError:
+        pass
+    return {"ok": True, "cleared_memory": had}
 
 # --- per-command permission plumbing (confirm mode) -------------------------
 # RUNS: active streaming turns, keyed by a run_id passed to the guard hook via
@@ -437,7 +528,8 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
     new_sid = result_data.get("session_id")
     if new_sid:
         SESSIONS[norm(proj)] = new_sid
-    yield {"type": "final", "ok": True, "reply": result_data.get("result", ""), "usage": extract_usage(result_data)}
+    reply = apply_memory_block(proj, result_data.get("result", ""))
+    yield {"type": "final", "ok": True, "reply": reply, "usage": extract_usage(result_data)}
 
 
 def read_tasks(d):
@@ -453,8 +545,15 @@ def init_greeting_stream(model=None, mode=None):
     if not os.path.isdir(proj):
         yield {"type": "final", "ok": False, "error": f"作業フォルダが存在しません: {proj}"}
         return
+    mem = read_memory(proj)
+    mem_section = (
+        "以下は前回までの『引き継ぎメモ（記憶ログ）』です。"
+        "これを最優先で踏まえて状況を把握してください:\n\n"
+        f"{mem}\n\n"
+    ) if mem else ""
     prompt = (
         f"作業対象フォルダ: {proj}\n\n"
+        f"{mem_section}"
         "以下はこのフォルダの TASKS.md の内容です:\n\n"
         f"{read_tasks(proj)}\n\n"
         "起動時の第一声として、次のフォーマットに厳密に従って出力してください。\n"
@@ -593,6 +692,10 @@ class Handler(BaseHTTPRequestHandler):
             # Called by the browser when the user clicks 許可 / 拒否.
             body = self._read_body()
             self._send_json(resolve_permission(body.get("id"), body.get("decision")))
+        elif self.path == "/api/clear":
+            # /clear typed in chat: drop the live session + delete the memory
+            # note for the current project (a backup is kept in TRASH first).
+            self._send_json(clear_history(CONFIG["current"]))
         elif self.path == "/api/projects/add":
             self._send_json(add_project(self._read_body().get("path")))
         elif self.path == "/api/projects/switch":

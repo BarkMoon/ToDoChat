@@ -172,7 +172,7 @@
       </select>
     </div>
     <div class="row">
-      <textarea id="input" placeholder="返信を入力（Enterで送信 / Shift+Enterで改行）" disabled></textarea>
+      <textarea id="input" placeholder="返信を入力（Enter送信 / Shift+Enter改行 / /clear で履歴と記憶を消去）" disabled></textarea>
       <button class="send" id="send" disabled>送信</button>
     </div>
   </footer>
@@ -432,6 +432,11 @@ const modelSel = document.getElementById('model');
 // text, then settles into rendered Markdown when the segment ends (a permission
 // request or the final event). `live` is the current bubble -- typing dots
 // until the first text chunk, then a text bubble.
+// The AI may append a [[TODOCHAT_MEMORY]]...[[/TODOCHAT_MEMORY]] block that the
+// server saves as the cross-restart hand-off note. It must never be shown, so
+// hide everything from the start marker onward while streaming (the server also
+// strips it from the final reply).
+function stripMemory(s){ const i = s.indexOf('[[TODOCHAT_MEMORY]]'); return i >= 0 ? s.slice(0, i).replace(/\s+$/, '') : s; }
 async function streamedTurn(path, payload, onFail){
   let live = null, liveIsText = false, liveText = '', final = null;
   function ensureTyping(){ if (!live){ live = typingBubble(); liveIsText = false; } }
@@ -442,7 +447,8 @@ async function streamedTurn(path, payload, onFail){
   }
   function finalizeLive(){
     if (!live) return;
-    if (liveIsText && liveText.trim()) live.innerHTML = renderMarkdown(liveText);
+    const shown = stripMemory(liveText);
+    if (liveIsText && shown.trim()) live.innerHTML = renderMarkdown(shown);
     else live.remove();
     live = null; liveIsText = false; liveText = '';
   }
@@ -451,7 +457,7 @@ async function streamedTurn(path, payload, onFail){
     await apiStream(path, payload, (ev) => {
       if (ev.type === 'delta'){
         const t = textTarget();
-        liveText += ev.text; t.textContent = liveText;
+        liveText += ev.text; t.textContent = stripMemory(liveText);
         log.scrollTop = log.scrollHeight;
       } else if (ev.type === 'permission_request'){
         finalizeLive();
@@ -487,9 +493,26 @@ async function init(){
     (msg) => bubble('起動時の応答取得に失敗しました:\n' + msg, 'err'));
   setBusy(false);
 }
+// /clear (like the Claude app): forget this project's chat continuity and its
+// memory note, then wipe the visible log. A backup of the note is kept server-
+// side in .todochat/trash (never re-read, so it costs no tokens).
+async function clearHistory(){
+  setBusy(true);
+  try {
+    const r = await api('/api/clear', {});
+    log.innerHTML = ''; resetContextBar();
+    const note = (r && r.cleared_memory)
+      ? 'チャット履歴と記憶ログを削除しました。（バックアップは .todochat/trash に保持）'
+      : 'チャット履歴を削除しました。（記憶ログはありませんでした）';
+    bubble(note, 'sys');
+    bubble('新しい会話を始められます。挨拶を表示するにはウィンドウを再読み込みしてください。', 'sys');
+  } catch (e){ bubble('削除に失敗しました: ' + e, 'err'); }
+  setBusy(false);
+}
 async function send(){
   const text = input.value.trim();
   if (!text || busy) return;
+  if (text === '/clear'){ input.value = ''; input.style.height = 'auto'; await clearHistory(); return; }
   const model = modelSel.value;   // captured at send time, per message
   const mode = currentMode();
   input.value = ''; input.style.height = 'auto';

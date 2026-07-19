@@ -28,4 +28,9 @@ projects.json
 # Dedicated Chromium profile for the app-window launcher (server.py)
 /.browser-profile/
 
+# Conversation-persistence store: per-project memory notes + their backups.
+# Backups (trash/) are retained copies of deleted/overwritten notes and are
+# NEVER read back by the server, so they never re-enter a prompt.
+/.todochat/
+
 # Note: TASKS.md is intentionally tracked (it is the app's task state).
