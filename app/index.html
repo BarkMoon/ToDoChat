@@ -172,7 +172,7 @@
       </select>
     </div>
     <div class="row">
-      <textarea id="input" placeholder="返信を入力（Enter送信 / Shift+Enter改行 / /clear で履歴と記憶を消去）" disabled></textarea>
+      <textarea id="input" placeholder="返信を入力（Enter送信 / Shift+Enter改行 / /remember で記憶を保存 / /clear で消去）" disabled></textarea>
       <button class="send" id="send" disabled>送信</button>
     </div>
   </footer>
@@ -468,7 +468,7 @@ async function streamedTurn(path, payload, onFail){
       }
     });
   } catch (e){
-    finalizeLive(); onFail('通信エラー: ' + e); return;
+    finalizeLive(); onFail('通信エラー: ' + e); return null;
   }
   // No text streamed (e.g. tool-only turn) but a final reply exists -> show it.
   if (final && final.ok && !liveIsText && final.reply && final.reply.trim()){
@@ -486,6 +486,7 @@ async function streamedTurn(path, payload, onFail){
     onFail('サーバーからの応答が途中で切断されました。'
          + 'サーバー(start.bat)のウィンドウにエラー内容が表示されている場合があります。');
   }
+  return final;
 }
 async function init(){
   setBusy(true);
@@ -509,10 +510,36 @@ async function clearHistory(){
   } catch (e){ bubble('削除に失敗しました: ' + e, 'err'); }
   setBusy(false);
 }
+// /remember: force a manual snapshot of the current state into the memory note
+// right now (normally the AI decides on its own whether to save one). The reply
+// is block-only, so nothing streams into the chat; we confirm with a sys note
+// and echo the saved summary so the user can see exactly what was captured.
+async function rememberSnapshot(){
+  bubble('/remember', 'user');
+  setBusy(true);
+  const final = await streamedTurn('/api/remember', { model: modelSel.value },
+    (msg) => bubble('スナップショットの保存に失敗しました:\n' + msg, 'err'));
+  if (final && final.ok){
+    if (final.remembered){
+      bubble('📌 現在の状態を記憶ログに保存しました。次回起動時に引き継がれます。', 'sys');
+      if (final.memory && final.memory.trim()){
+        const el = document.createElement('div');
+        el.className = 'msg ai';
+        el.innerHTML = '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">保存した記憶ログ</div>'
+                     + renderMarkdown(final.memory);
+        log.appendChild(el); log.scrollTop = log.scrollHeight;
+      }
+    } else {
+      bubble('記憶すべき進行中の状態が見つからなかったため、保存しませんでした。', 'sys');
+    }
+  }
+  setBusy(false);
+}
 async function send(){
   const text = input.value.trim();
   if (!text || busy) return;
   if (text === '/clear'){ input.value = ''; input.style.height = 'auto'; await clearHistory(); return; }
+  if (text === '/remember'){ input.value = ''; input.style.height = 'auto'; await rememberSnapshot(); return; }
   const model = modelSel.value;   // captured at send time, per message
   const mode = currentMode();
   input.value = ''; input.style.height = 'auto';

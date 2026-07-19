@@ -169,12 +169,14 @@ def backup_memory(proj):
 
 def apply_memory_block(proj, reply_text):
     """If a reply carries a memory block, persist its contents (backing up the
-    prior note first) and return the reply with the block stripped for display.
-    Only writes when the note actually changed, so identical re-emissions don't
-    spam TRASH."""
+    prior note first) and return (stripped_reply, had_memory). had_memory is True
+    whenever a non-empty block was present -- even if identical to the stored note
+    (so /remember can confirm "captured" without needing a disk change). Only
+    writes when the note actually changed, so identical re-emissions don't spam
+    TRASH."""
     m = MEMORY_RE.search(reply_text or "")
     if not m:
-        return reply_text
+        return reply_text, False
     new = m.group(1).strip()
     if new and new != read_memory(proj):
         backup_memory(proj)
@@ -183,7 +185,7 @@ def apply_memory_block(proj, reply_text):
             memory_path(proj).write_text(new, encoding="utf-8")
         except OSError:
             pass
-    return MEMORY_RE.sub("", reply_text).strip()
+    return MEMORY_RE.sub("", reply_text).strip(), bool(new)
 
 
 def clear_history(proj):
@@ -200,6 +202,51 @@ def clear_history(proj):
     except OSError:
         pass
     return {"ok": True, "cleared_memory": had}
+
+
+# /remember: force a manual snapshot of the current session into the memory note
+# now, regardless of whether the AI judged the state worth saving on its own. We
+# resume the live session so the summary reflects the actual conversation, ask
+# for the memory block ONLY (no chit-chat), and let the normal apply_memory_block
+# path persist it. Advisory mode = read-only, so no approval cards interrupt it.
+REMEMBER_PROMPT = (
+    "【手動スナップショット要求 /remember】\n"
+    "ユーザーが現在の状態を記憶ログへ手動で保存するよう要求しました。\n"
+    "これまでの会話と作業状況をふまえ、アプリ再起動後に引き継ぐべき"
+    "『進行中タスクの状態・決定事項・次の一手・重要なパスや事実』を数行で簡潔に要約し、"
+    "必ず次の形式の記憶ブロックだけを出力してください。"
+    "前置き・後書き・その他の文章は一切書かないでください:\n"
+    "[[TODOCHAT_MEMORY]]\n"
+    "(数行の簡潔な要約)\n"
+    "[[/TODOCHAT_MEMORY]]"
+)
+
+
+def remember_stream(model=None):
+    """Drive a forced snapshot turn and report whether it was saved. Yields the
+    same event stream as a normal turn (deltas are hidden client-side, since we
+    asked for block-only output), but the final event carries `remembered` and
+    the saved `memory` text so the UI can confirm and echo it."""
+    proj = CONFIG["current"]
+    if not os.path.isdir(proj):
+        yield {"type": "final", "ok": False, "error": f"作業フォルダが存在しません: {proj}"}
+        return
+    for ev in run_claude_stream(REMEMBER_PROMPT, resume=True, model=model, mode="advisory"):
+        if ev.get("type") == "final" and ev.get("ok"):
+            saved = ev.get("memory_saved", False)
+            reply = (ev.get("reply") or "").strip()
+            # Fallback: the model answered but skipped the markers -> treat the
+            # whole reply as the snapshot so /remember never silently no-ops.
+            if not saved and reply:
+                backup_memory(proj)
+                try:
+                    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+                    memory_path(proj).write_text(reply, encoding="utf-8")
+                    saved = True
+                except OSError:
+                    pass
+            ev = dict(ev, remembered=saved, memory=read_memory(proj))
+        yield ev
 
 # --- per-command permission plumbing (confirm mode) -------------------------
 # RUNS: active streaming turns, keyed by a run_id passed to the guard hook via
@@ -528,8 +575,9 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
     new_sid = result_data.get("session_id")
     if new_sid:
         SESSIONS[norm(proj)] = new_sid
-    reply = apply_memory_block(proj, result_data.get("result", ""))
-    yield {"type": "final", "ok": True, "reply": reply, "usage": extract_usage(result_data)}
+    reply, had_memory = apply_memory_block(proj, result_data.get("result", ""))
+    yield {"type": "final", "ok": True, "reply": reply,
+           "usage": extract_usage(result_data), "memory_saved": had_memory}
 
 
 def read_tasks(d):
@@ -692,6 +740,11 @@ class Handler(BaseHTTPRequestHandler):
             # Called by the browser when the user clicks 許可 / 拒否.
             body = self._read_body()
             self._send_json(resolve_permission(body.get("id"), body.get("decision")))
+        elif self.path == "/api/remember":
+            # /remember typed in chat: force a manual snapshot of the current
+            # session into the memory note now (streamed like a normal turn).
+            body = self._read_body()
+            self._stream_ndjson(remember_stream(model=body.get("model")))
         elif self.path == "/api/clear":
             # /clear typed in chat: drop the live session + delete the memory
             # note for the current project (a backup is kept in TRASH first).
