@@ -1,0 +1,159 @@
+# ToDoChat 安全コマンド許可リスト
+# ============================================================================
+# ここに載っているコマンドは「実行（都度確認）」モードで自動的に許可されます
+# （確認カードは表示されますが、クリック不要）。ファイル・ブランチ・リポジトリの
+# 状態を変えない“読み取り専用”の操作だけを載せてください。
+#
+# 書き方:
+#   ・1行1要素。前後の空白は無視されます。
+#   ・空行と、# で始まる行はコメントとして無視されます。
+#   ・[セクション名] で種類を区切ります。
+#
+# 迷ったら載せないでください。ここに無いコマンドは従来どおり手動確認になるだけで、
+# 安全側に倒れます（＝誤って危険な操作が自動実行されることはありません）。
+#
+# 注意:
+#   ・リダイレクト(> <)、コマンド置換($() ``)、サブシェル、`&`(バックグラウンド)、
+#     改行を含むコマンドは、たとえ中身が安全に見えても自動許可されません
+#     （この判定は safe_shell.py 側で行っています）。
+#   ・`|` `&&` `||` `;` で連結された場合は、連結された全コマンドがこのリストに
+#     載っているときだけ自動許可されます（例: `git log | head`）。
+# ============================================================================
+
+
+# [commands]
+# git 以外の、単体で読み取り専用のコマンド（出力は標準出力のみ。ファイルへの
+# 書き込みはリダイレクトが必要＝自動許可されない）。
+# 他プログラムを実行できるもの(env, xargs, find, sudo, watch, time ...)や、
+# ファイルを書き換えるもの(sed -i, tee, cp, mv, rm, touch ...)は載せないこと。
+[commands]
+echo
+printf
+cat
+head
+tail
+nl
+tac
+ls
+dir
+pwd
+tree
+wc
+sort
+cut
+tr
+rev
+fold
+column
+comm
+join
+paste
+grep
+egrep
+fgrep
+basename
+dirname
+realpath
+readlink
+date
+whoami
+hostname
+uname
+id
+groups
+tty
+which
+where
+type
+whereis
+printenv
+stat
+file
+du
+df
+seq
+true
+false
+diff
+cmp
+md5sum
+sha1sum
+sha256sum
+cksum
+
+
+# [git-readonly]
+# フラグに関係なく読み取り専用の git サブコマンド。ファイル・インデックス・
+# 作業ツリー・ref のいずれも変更しません。
+# （commit / checkout / switch / reset / merge / rebase / pull / push / fetch /
+#  add / rm / stash / gc などの状態を変えるものは載せないこと）
+[git-readonly]
+status
+log
+diff
+show
+blame
+reflog
+shortlog
+describe
+rev-parse
+rev-list
+ls-files
+ls-tree
+ls-remote
+cat-file
+whatchanged
+show-ref
+show-branch
+name-rev
+var
+count-objects
+grep
+merge-base
+cherry
+for-each-ref
+check-ignore
+check-attr
+verify-commit
+verify-tag
+get-tar-commit-id
+
+
+# [git-listing.*] — 「一覧表示のときだけ」安全な git サブコマンド。
+# これらは引数次第で変更操作にもなる（git branch -d / git tag v1 / git remote add
+# など）ため、下に列挙した“一覧表示専用フラグ”だけで構成されている場合に限り
+# 自動許可します。位置引数や変更フラグが1つでも混じれば手動確認に回ります。
+# 値を取るフラグ(--sort <key> 等)はあえて載せていません（載せると値の部分が
+# 危険な引数と区別できないため）。
+
+[git-listing.branch]
+-a
+-r
+-v
+-vv
+-av
+-va
+-rv
+-vr
+-ra
+-ar
+--all
+--remotes
+--verbose
+--list
+-l
+--color
+--no-color
+
+# 注意: `git tag -a`(注釈付きタグ作成) は変更操作なので -a は載せないこと。
+[git-listing.tag]
+-l
+--list
+-n
+-n1
+--color
+--no-color
+
+[git-listing.remote]
+-v
+--verbose

@@ -21,6 +21,8 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from safe_shell import is_safe_command   # read-only-command allowlist (auto-approve)
+
 # --- paths / config ---------------------------------------------------------
 HOST = "127.0.0.1"
 PORT = 8765
@@ -123,16 +125,27 @@ PENDING_LOCK = threading.Lock()
 def request_permission(run_id, tool, tool_input):
     """Called on the hook's HTTP thread. Surfaces an approval request into the
     active run's stream and blocks until the user answers (or we time out ->
-    deny). Returns "allow" or "deny"."""
+    deny). Returns "allow" or "deny".
+
+    Read-only commands on the safe_shell allowlist (git log/status, head, echo,
+    ...) are AUTO-approved: the card is still pushed to the stream so the user
+    sees what ran, but we return "allow" immediately instead of blocking for a
+    click."""
     with RUNS_LOCK:
         run = RUNS.get(run_id)
     if not run:
         return "deny"   # no active stream to ask through
+    command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+    if tool == "Bash" and is_safe_command(command):
+        run["queue"].put(("perm_request", {
+            "id": uuid.uuid4().hex, "tool": tool, "command": command,
+            "input": tool_input, "auto": True,
+        }))
+        return "allow"
     perm_id = uuid.uuid4().hex
     ev = threading.Event()
     with PENDING_LOCK:
         PENDING_PERMS[perm_id] = {"event": ev, "decision": None}
-    command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
     run["perm_pending"] = True   # pause the inactivity watchdog while the user thinks
     run["queue"].put(("perm_request", {
         "id": perm_id, "tool": tool, "command": command, "input": tool_input,

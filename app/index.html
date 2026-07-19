@@ -312,6 +312,17 @@ function permissionCard(ev){
   const cmd = document.createElement('pre');
   cmd.className = 'perm-cmd';
   cmd.textContent = ev.command || JSON.stringify(ev.input || {}, null, 2);   // textContent = XSS-safe
+  // Safe read-only command (git log/status, head, echo, ...): the server has
+  // already auto-approved it. Show the card for visibility, no buttons to click.
+  if (ev.auto){
+    head.textContent = '🛡️ 安全な操作を自動実行';
+    const st = document.createElement('div');
+    st.className = 'perm-status allow';
+    st.textContent = '✅ 安全な操作として自動許可しました';
+    card.append(head, cmd, st);
+    log.appendChild(card); log.scrollTop = log.scrollHeight;
+    return;
+  }
   const actions = document.createElement('div');
   actions.className = 'perm-actions';
   const allow = document.createElement('button'); allow.className = 'perm-allow'; allow.textContent = '許可';
