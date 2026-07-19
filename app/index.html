@@ -37,6 +37,30 @@
   .spacer { flex: 1; }
   .status { font-size: 12px; color: var(--muted); min-width: 56px; text-align: right; }
 
+  /* edit-mode toggle */
+  .modewrap { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .modewrap .badge {
+    padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--muted); user-select: none;
+  }
+  .modewrap .badge.on { color: #ffd479; border-color: #7a5a1a; background: #2a230f; }
+  .switch { position: relative; width: 38px; height: 20px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider {
+    position: absolute; inset: 0; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 999px; cursor: pointer; transition: background .2s ease;
+  }
+  .switch .slider::before {
+    content: ""; position: absolute; width: 14px; height: 14px; left: 2px; top: 2px;
+    background: var(--muted); border-radius: 50%; transition: transform .2s ease, background .2s ease;
+  }
+  .switch input:checked + .slider { background: #4a3512; border-color: #7a5a1a; }
+  .switch input:checked + .slider::before { transform: translateX(18px); background: #ffd479; }
+  .denials {
+    align-self: flex-start; max-width: 90%; font-size: 12px; color: #ffb4bb;
+    background: #3a1f24; border: 1px solid #5a2a30; border-radius: 8px; padding: 6px 10px;
+  }
+
   /* token usage strip */
   #tokstrip {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
@@ -108,6 +132,13 @@
       <button class="iconbtn" id="delProj" title="一覧から削除（フォルダは消えません）">🗑</button>
     </div>
     <span class="spacer"></span>
+    <div class="modewrap">
+      <span class="badge" id="modeBadge">🔒 助言のみ</span>
+      <label class="switch" title="編集モード（作業フォルダ内のファイル編集を許可）の切替">
+        <input type="checkbox" id="editMode">
+        <span class="slider"></span>
+      </label>
+    </div>
     <span class="status" id="status">起動中…</span>
   </header>
 
@@ -140,7 +171,34 @@ const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const statusEl = document.getElementById('status');
 const projSel = document.getElementById('proj');
+const editModeChk = document.getElementById('editMode');
+const modeBadge = document.getElementById('modeBadge');
 let busy = false;
+
+function currentMode(){ return editModeChk.checked ? 'edit' : 'advisory'; }
+function updateModeBadge(){
+  if (editModeChk.checked){
+    modeBadge.textContent = '✏️ 編集許可'; modeBadge.classList.add('on');
+    modeBadge.title = '作業フォルダ内のファイル編集(Edit/Write)のみ許可。フォルダ外への書込とシェル実行(Bash)は無効。';
+  } else {
+    modeBadge.textContent = '🔒 助言のみ'; modeBadge.classList.remove('on');
+    modeBadge.title = 'Read/Glob/Grepのみ許可（ファイル編集・コマンド実行なし）';
+  }
+}
+editModeChk.addEventListener('change', () => {
+  if (editModeChk.checked){
+    const okGo = confirm(
+      '編集モードをオンにしますか？\n\n' +
+      'AIがこの作業フォルダ内のファイルを作成・編集できるようになります。\n' +
+      '・フォルダ外への書き込みは自動でブロックされます\n' +
+      '・シェル実行(Bash)は無効です\n' +
+      '・編集内容はGitで元に戻せます'
+    );
+    if (!okGo){ editModeChk.checked = false; }
+  }
+  updateModeBadge();
+});
+updateModeBadge();
 
 // ---- token usage ----
 const totals = { prompt: 0, out: 0, cacheR: 0, cacheC: 0, cost: 0 };
@@ -224,13 +282,21 @@ function bubble(text, cls){
   if (cls === 'ai') el.innerHTML = renderMarkdown(text); else el.textContent = text;
   log.appendChild(el); log.scrollTop = log.scrollHeight; return el;
 }
+function showDenials(denials){
+  if (!denials || !denials.length) return;
+  const el = document.createElement('div');
+  el.className = 'denials';
+  el.textContent = '⚠ 安全フィルタにより一部の操作がブロックされました（' + denials.length + '件）: ' +
+    denials.map(d => (d && (d.tool_name || d.reason)) || JSON.stringify(d)).join(' / ');
+  log.appendChild(el); log.scrollTop = log.scrollHeight;
+}
 function typingBubble(){
   const el = document.createElement('div'); el.className = 'msg ai';
   el.innerHTML = '<span class="typing"><span></span><span></span><span></span></span>';
   log.appendChild(el); log.scrollTop = log.scrollHeight; return el;
 }
 function setBusy(b){
-  busy = b; input.disabled = b; sendBtn.disabled = b; projSel.disabled = b;
+  busy = b; input.disabled = b; sendBtn.disabled = b; projSel.disabled = b; editModeChk.disabled = b;
   statusEl.textContent = b ? '考え中…' : '待機中';
   if (!b) input.focus();
 }
@@ -300,9 +366,9 @@ async function init(){
   setBusy(true);
   const placeholder = typingBubble();
   try {
-    const data = await api('/api/init', { model: modelSel.value });
+    const data = await api('/api/init', { model: modelSel.value, mode: currentMode() });
     placeholder.remove();
-    if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); }
+    if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); showDenials(data.usage && data.usage.permission_denials); }
     else bubble('起動時の応答取得に失敗しました:\n' + (data.error || '不明なエラー'), 'err');
   } catch (e){ placeholder.remove(); bubble('サーバに接続できませんでした: ' + e, 'err'); }
   setBusy(false);
@@ -311,13 +377,14 @@ async function send(){
   const text = input.value.trim();
   if (!text || busy) return;
   const model = modelSel.value;   // captured at send time, per message
+  const mode = currentMode();
   input.value = ''; input.style.height = 'auto';
   bubble(text, 'user'); setBusy(true);
   const placeholder = typingBubble();
   try {
-    const data = await api('/api/chat', { message: text, model });
+    const data = await api('/api/chat', { message: text, model, mode });
     placeholder.remove();
-    if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); }
+    if (data.ok){ addUsage(data.usage); bubble(data.reply, 'ai'); showDenials(data.usage && data.usage.permission_denials); }
     else bubble(data.error || '不明なエラー', 'err');
   } catch (e){ placeholder.remove(); bubble('通信エラー: ' + e, 'err'); }
   setBusy(false);

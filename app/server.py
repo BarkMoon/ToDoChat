@@ -11,6 +11,7 @@ of folders is persisted to projects.json next to this app.
 import json
 import os
 import subprocess
+import sys
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,8 +34,33 @@ PERSONA = (
     "常に日本語で、要点を先に、簡潔に答えます。"
     "先回りして次の具体的なアクションを1つ提案してください。"
 )
-ALLOWED_TOOLS = ["Read", "Glob", "Grep"]   # v0: read-only exploration
+# Two modes, chosen per-message from the UI (defaults to advisory, the safer one):
+#   advisory - read-only exploration, no file/shell access.
+#   edit     - file editing (Edit/Write) confined to the working folder.
+#
+# IMPORTANT safety note: in headless (-p) mode there is NO built-in classifier or
+# path confinement. A tool listed in --allowedTools runs unconditionally and can
+# write ANYWHERE on disk (verified: an allow-listed Write reaches absolute paths
+# outside the folder). --permission-mode auto does not gate here either -- it just
+# denies non-allow-listed tools. So the real boundary is a PreToolUse hook
+# (app/edit_guard.py) that denies shell execution and any write that escapes the
+# working folder. Bash is intentionally NOT granted in v1 (safe shell allow-listing
+# is a separate, harder problem -- see TASKS.md).
+ADVISORY_TOOLS = ["Read", "Glob", "Grep"]
+EDIT_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write"]   # no Bash; hook confines writes
+GUARD_HOOK = APP_DIR / "edit_guard.py"
 TIMEOUT_SEC = 240
+
+
+def guard_settings_arg():
+    """A --settings JSON string registering the edit-mode PreToolUse guard hook.
+    Passed inline (the CLI accepts a JSON string, not just a file path)."""
+    py = sys.executable.replace("\\", "/")
+    guard = str(GUARD_HOOK).replace("\\", "/")
+    command = '"%s" "%s"' % (py, guard)
+    return json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "*", "hooks": [{"type": "command", "command": command}]},
+    ]}})
 
 # Models selectable per-message from the UI. Keys are what the client sends;
 # values are the --model alias the CLI accepts ("opus"/"sonnet"/"haiku").
@@ -148,28 +174,36 @@ def extract_usage(data):
         "prompt_tokens": inp + cr + cc,      # size of this turn's prompt (context used)
         "context_window": ctx or 200000,
         "cost_usd": data.get("total_cost_usd", 0) or 0,
+        "permission_denials": data.get("permission_denials") or [],
     }
 
 
-def run_claude(prompt, resume=True, model=None):
+def run_claude(prompt, resume=True, model=None, mode=None):
     proj = CONFIG["current"]
     if not os.path.isdir(proj):
         return {"ok": False, "error": f"作業フォルダが存在しません: {proj}"}
 
     model_alias = MODELS.get(model, MODELS[DEFAULT_MODEL])
+    edit_mode = mode == "edit"
     cmd = [
         CLI, "-p", prompt,
         "--output-format", "json",
         "--append-system-prompt", PERSONA,
-        "--allowedTools", *ALLOWED_TOOLS,
+        "--allowedTools", *(EDIT_TOOLS if edit_mode else ADVISORY_TOOLS),
         "--model", model_alias,
     ]
+    env = None
+    if edit_mode:
+        # The guard hook is the enforcement boundary; TODOCHAT_PROJECT_ROOT tells
+        # it which folder writes must stay inside (matches this spawn's cwd).
+        cmd += ["--settings", guard_settings_arg()]
+        env = dict(os.environ, TODOCHAT_PROJECT_ROOT=proj)
     sid = SESSIONS.get(norm(proj)) if resume else None
     if sid:
         cmd += ["--resume", sid]
 
     try:
-        proc = subprocess.run(cmd, cwd=proj, capture_output=True, timeout=TIMEOUT_SEC)
+        proc = subprocess.run(cmd, cwd=proj, capture_output=True, timeout=TIMEOUT_SEC, env=env)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "応答がタイムアウトしました。もう一度お試しください。"}
     except FileNotFoundError:
@@ -199,7 +233,7 @@ def read_tasks(d):
         return "(このフォルダに TASKS.md はありません)"
 
 
-def init_greeting(model=None):
+def init_greeting(model=None, mode=None):
     proj = CONFIG["current"]
     SESSIONS.pop(norm(proj), None)   # start a fresh conversation for this folder
     if not os.path.isdir(proj):
@@ -214,7 +248,7 @@ def init_greeting(model=None):
         "(3) 他に優先すべきことがないかユーザーへ一言問いかけ\n"
         "TASKS.md が無い場合は、フォルダ内のコードやREADMEなどから状況を推測して要約してください。"
     )
-    return run_claude(prompt, resume=False, model=model)
+    return run_claude(prompt, resume=False, model=model, mode=mode)
 
 
 # --- HTTP handler -----------------------------------------------------------
@@ -257,14 +291,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/init":
             body = self._read_body()
-            self._send_json(init_greeting(model=body.get("model")))
+            self._send_json(init_greeting(model=body.get("model"), mode=body.get("mode")))
         elif self.path == "/api/chat":
             body = self._read_body()
             msg = (body.get("message") or "").strip()
             if not msg:
                 self._send_json({"ok": False, "error": "メッセージが空です。"})
                 return
-            self._send_json(run_claude(msg, resume=True, model=body.get("model")))
+            self._send_json(run_claude(msg, resume=True, model=body.get("model"), mode=body.get("mode")))
         elif self.path == "/api/projects/add":
             self._send_json(add_project(self._read_body().get("path")))
         elif self.path == "/api/projects/switch":
