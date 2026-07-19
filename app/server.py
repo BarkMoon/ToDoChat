@@ -272,6 +272,64 @@ def remember_stream(model=None):
             ev = dict(ev, remembered=saved, memory=read_memory(proj))
         yield ev
 
+
+def snapshot_memory_blocking(proj, timeout=120):
+    """Synchronous (non-streaming) forced snapshot, used by the auto-remember-on-
+    close feature. There is no browser to stream to at shutdown, so we spawn the
+    CLI, wait for the single JSON result, and persist it via apply_memory_block.
+
+    Uses haiku to keep shutdown quick (the note is a short summary), resumes the
+    live session so it reflects the conversation, and is skipped entirely when no
+    session exists yet (nothing meaningful to remember). Best-effort: never
+    raises; returns True if a note was saved."""
+    if not os.path.isdir(proj):
+        return False
+    sid = SESSIONS.get(norm(proj))
+    if not sid:
+        return False   # no conversation happened -> nothing worth snapshotting
+    cmd = [
+        CLI, "-p", REMEMBER_PROMPT,
+        "--output-format", "json",
+        "--append-system-prompt", PERSONA,
+        "--allowedTools", *ADVISORY_TOOLS,
+        "--model", MODELS.get("haiku", MODELS[DEFAULT_MODEL]),
+        "--resume", sid,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=proj, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+        )
+        data = json.loads(proc.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+    if not isinstance(data, dict) or data.get("is_error"):
+        return False
+    reply = data.get("result", "") or ""
+    _, had = apply_memory_block(proj, reply)
+    if not had and reply.strip():
+        # No markers -> treat the whole reply as the snapshot (same fallback as
+        # remember_stream) so an enabled toggle never silently saves nothing.
+        try:
+            backup_memory(proj)
+            MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+            memory_path(proj).write_text(reply.strip(), encoding="utf-8")
+            had = True
+        except OSError:
+            pass
+    return had
+
+
+def finalize_memory_if_enabled():
+    """Run the auto-close snapshot iff the toggle is on. Called on every real
+    shutdown path (the 終了 button and a window close), never on a reload."""
+    if not CONFIG.get("auto_remember"):
+        return False
+    try:
+        return snapshot_memory_blocking(CONFIG["current"])
+    except Exception:
+        return False
+
 # --- per-command permission plumbing (confirm mode) -------------------------
 # RUNS: active streaming turns, keyed by a run_id passed to the guard hook via
 # env. Each holds a queue the streaming generator drains -- the hook endpoint
@@ -370,6 +428,9 @@ def _shutdown_check():
     # A heartbeat after we armed means a page is still alive (a reload) -> abort.
     if _last_alive > _arm_time:
         return
+    # Real window close: optionally snapshot memory before the process exits.
+    # (The page is already gone, so this MUST happen server-side.)
+    finalize_memory_if_enabled()
     stop_server()
 
 
@@ -390,7 +451,16 @@ def stop_server():
 
 # --- project management -----------------------------------------------------
 def list_projects():
-    return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"]}
+    return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"],
+            "auto_remember": bool(CONFIG.get("auto_remember"))}
+
+
+def set_auto_remember(enabled):
+    """Persist the 'snapshot memory on window close' toggle into projects.json so
+    the button restores its last state on the next launch."""
+    CONFIG["auto_remember"] = bool(enabled)
+    save_config(CONFIG)
+    return {"ok": True, "enabled": CONFIG["auto_remember"]}
 
 
 def add_project(path):
@@ -787,6 +857,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(remove_project(self._read_body().get("path")))
         elif self.path == "/api/projects/browse":
             self._send_json(browse_folder())
+        elif self.path == "/api/auto-remember":
+            # Toggle "snapshot memory on window close"; persisted to projects.json.
+            self._send_json(set_auto_remember(self._read_body().get("enabled")))
         elif self.path == "/api/alive":
             # Heartbeat from an open page; also cancels a reload-armed shutdown.
             note_alive()
@@ -797,8 +870,11 @@ class Handler(BaseHTTPRequestHandler):
             arm_shutdown()
             self._send_json({"ok": True})
         elif self.path == "/api/quit":
-            # The 終了 button: stop immediately.
-            self._send_json({"ok": True})
+            # The 終了 button: optionally snapshot memory (blocks a few seconds
+            # while the CLI runs) before stopping. The client awaits this reply,
+            # so it can show "記憶を保存して終了中…" during the wait.
+            remembered = finalize_memory_if_enabled()
+            self._send_json({"ok": True, "remembered": remembered})
             stop_server()
         else:
             self.send_error(404)

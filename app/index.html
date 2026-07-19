@@ -47,6 +47,21 @@
   }
   select#mode.edit { color: #ffd479; border-color: #7a5a1a; }
   select#mode.confirm { color: #7ee0a0; border-color: #2f7a4a; }
+
+  /* auto-remember-on-close toggle */
+  .pilltoggle {
+    background: var(--panel2); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 999px; padding: 5px 11px; font: inherit; font-size: 12px;
+    cursor: pointer; white-space: nowrap; display: inline-flex; align-items: center; gap: 5px;
+  }
+  .pilltoggle:hover { border-color: var(--accent); }
+  .pilltoggle:disabled { opacity: .5; cursor: default; }
+  .pilltoggle .sw {
+    font-weight: 700; font-size: 11px; letter-spacing: .5px;
+    border-radius: 999px; padding: 1px 7px; background: var(--code); border: 1px solid var(--border);
+  }
+  .pilltoggle.on { color: #7ee0a0; border-color: #2f7a4a; background: #14251b; }
+  .pilltoggle.on .sw { color: #08111f; background: #7ee0a0; border-color: #7ee0a0; }
   .denials {
     align-self: flex-start; max-width: 90%; font-size: 12px; color: #ffb4bb;
     background: #3a1f24; border: 1px solid #5a2a30; border-radius: 8px; padding: 6px 10px;
@@ -197,6 +212,7 @@
         <option value="confirm" selected>▶️ 実行（都度確認）</option>
       </select>
     </div>
+    <button class="pilltoggle" id="autoRemBtn" title="ウィンドウ終了時に、現在の状態を自動で記憶ログへ保存します（次回起動時に引き継がれます）">💾 終了時記憶<span class="sw" id="autoRemState">OFF</span></button>
     <span class="status" id="status">起動中…</span>
     <button class="iconbtn quit" id="quitBtn" title="ToDoChatを終了（サーバーを停止してウィンドウを閉じます）">✕</button>
   </header>
@@ -268,6 +284,30 @@ function updateModeStyle(){
 }
 modeSel.addEventListener('change', updateModeStyle);
 updateModeStyle();
+
+// ---- auto-remember-on-close toggle ----
+// When ON, closing the window (✕ button or closing the app window) makes the
+// server snapshot the current state into the memory note before it exits. The
+// state is persisted server-side (projects.json), so it restores on next launch.
+const autoRemBtn = document.getElementById('autoRemBtn');
+const autoRemState = document.getElementById('autoRemState');
+let autoRemember = false;
+function renderAutoRemember(){
+  autoRemBtn.classList.toggle('on', autoRemember);
+  autoRemState.textContent = autoRemember ? 'ON' : 'OFF';
+}
+async function toggleAutoRemember(){
+  const next = !autoRemember;
+  autoRemBtn.disabled = true;
+  try {
+    const r = await api('/api/auto-remember', { enabled: next });
+    if (r.ok) autoRemember = !!r.enabled;
+  } catch(_){}
+  renderAutoRemember();
+  autoRemBtn.disabled = false;
+}
+autoRemBtn.addEventListener('click', toggleAutoRemember);
+renderAutoRemember();
 
 // ---- token usage ----
 const totals = { prompt: 0, out: 0, cacheR: 0, cacheC: 0, cost: 0 };
@@ -451,6 +491,8 @@ async function loadProjects(){
       if (p.path === data.current) o.selected = true;
       projSel.appendChild(o);
     });
+    autoRemember = !!data.auto_remember;   // restore last-saved toggle state
+    renderAutoRemember();
   } catch (_) {}
 }
 async function switchTo(path){
@@ -687,6 +729,9 @@ setInterval(heartbeat, 4000);
 document.getElementById('quitBtn').addEventListener('click', async () => {
   if (!confirm('ToDoChatを終了しますか？\nサーバーを停止し、ウィンドウを閉じます。')) return;
   quitting = true;
+  // When auto-remember is on the server snapshots memory before replying, so the
+  // await below can take a few seconds -- tell the user what's happening.
+  statusEl.textContent = autoRemember ? '記憶を保存して終了中…' : '終了中…';
   try { await api('/api/quit', {}); } catch (_) {}
   statusEl.textContent = '終了しました';
   window.close();                                // closes the --app window if allowed
