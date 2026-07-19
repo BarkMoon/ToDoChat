@@ -10,10 +10,12 @@ of folders is persisted to projects.json next to this app.
 """
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,22 +37,30 @@ PERSONA = (
     "常に日本語で、要点を先に、簡潔に答えます。"
     "先回りして次の具体的なアクションを1つ提案してください。"
 )
-# Two modes, chosen per-message from the UI (defaults to advisory, the safer one):
+# Three modes, chosen per-message from the UI:
 #   advisory - read-only exploration, no file/shell access.
-#   edit     - file editing (Edit/Write) confined to the working folder.
+#   edit     - file editing (Edit/Write) confined to the working folder; no shell.
+#   confirm  - file editing confined to the folder PLUS shell/app execution (Bash),
+#              but every Bash command is approved by the user one at a time (the
+#              guard hook calls back to /api/hook/permission and blocks until the
+#              browser answers). This is the UI default.
 #
 # IMPORTANT safety note: in headless (-p) mode there is NO built-in classifier or
 # path confinement. A tool listed in --allowedTools runs unconditionally and can
 # write ANYWHERE on disk (verified: an allow-listed Write reaches absolute paths
 # outside the folder). --permission-mode auto does not gate here either -- it just
 # denies non-allow-listed tools. So the real boundary is a PreToolUse hook
-# (app/edit_guard.py) that denies shell execution and any write that escapes the
-# working folder. Bash is intentionally NOT granted in v1 (safe shell allow-listing
-# is a separate, harder problem -- see TASKS.md).
+# (app/edit_guard.py). Its deny is authoritative and overrides --allowedTools
+# (verified), so Bash can be allow-listed in confirm mode while the hook still
+# blocks every command the user hasn't approved.
 ADVISORY_TOOLS = ["Read", "Glob", "Grep"]
-EDIT_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write"]   # no Bash; hook confines writes
+EDIT_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write"]            # no Bash; hook confines writes
+CONFIRM_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash"]  # Bash gated per-command by the hook
+TOOLS_BY_MODE = {"advisory": ADVISORY_TOOLS, "edit": EDIT_TOOLS, "confirm": CONFIRM_TOOLS}
+HOOK_MODES = ("edit", "confirm")   # modes that register the guard hook
 GUARD_HOOK = APP_DIR / "edit_guard.py"
-TIMEOUT_SEC = 240
+STREAM_INACTIVITY_TIMEOUT = 300    # kill claude after this many seconds of no output (paused while awaiting approval)
+PERM_WAIT_TIMEOUT = 300            # how long the server waits for the user's allow/deny before denying
 
 
 def guard_settings_arg():
@@ -96,6 +106,54 @@ def load_config():
 
 CONFIG = load_config()
 SESSIONS = {}   # norm(project_path) -> claude session_id (in-memory only)
+
+# --- per-command permission plumbing (confirm mode) -------------------------
+# RUNS: active streaming turns, keyed by a run_id passed to the guard hook via
+# env. Each holds a queue the streaming generator drains -- the hook endpoint
+# pushes permission_request items onto it so they interleave with claude output.
+# PENDING_PERMS: in-flight approval requests, keyed by perm_id; the hook thread
+# blocks on the Event until the browser answers via /api/permission-response.
+RUNS = {}
+RUNS_LOCK = threading.Lock()
+PENDING_PERMS = {}
+PENDING_LOCK = threading.Lock()
+
+
+def request_permission(run_id, tool, tool_input):
+    """Called on the hook's HTTP thread. Surfaces an approval request into the
+    active run's stream and blocks until the user answers (or we time out ->
+    deny). Returns "allow" or "deny"."""
+    with RUNS_LOCK:
+        run = RUNS.get(run_id)
+    if not run:
+        return "deny"   # no active stream to ask through
+    perm_id = uuid.uuid4().hex
+    ev = threading.Event()
+    with PENDING_LOCK:
+        PENDING_PERMS[perm_id] = {"event": ev, "decision": None}
+    command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+    run["perm_pending"] = True   # pause the inactivity watchdog while the user thinks
+    run["queue"].put(("perm_request", {
+        "id": perm_id, "tool": tool, "command": command, "input": tool_input,
+    }))
+    got = ev.wait(PERM_WAIT_TIMEOUT)
+    run["perm_pending"] = False
+    run["last"] = time.time()
+    with PENDING_LOCK:
+        rec = PENDING_PERMS.pop(perm_id, None)
+    decision = (rec or {}).get("decision") if got else None
+    return decision if decision in ("allow", "deny") else "deny"
+
+
+def resolve_permission(perm_id, decision):
+    """Called on the browser's HTTP thread to answer a pending request."""
+    with PENDING_LOCK:
+        rec = PENDING_PERMS.get(perm_id)
+    if not rec:
+        return {"ok": False, "error": "対象の許可リクエストが見つかりません（期限切れの可能性）。"}
+    rec["decision"] = "allow" if decision == "allow" else "deny"
+    rec["event"].set()
+    return {"ok": True}
 
 
 # --- project management -----------------------------------------------------
@@ -180,40 +238,51 @@ def extract_usage(data):
 
 
 def run_claude_stream(prompt, resume=True, model=None, mode=None):
-    """Generator: yields {"type":"delta","text":...} chunks as the reply is
-    generated, then exactly one {"type":"final", ok:..., reply/error, usage}
-    event with the same shape the UI previously got from a single JSON call."""
+    """Generator yielding, as the reply is produced:
+        {"type":"delta","text":...}                       streamed reply text
+        {"type":"permission_request","id",...}            confirm mode: awaiting user approval
+        {"type":"final", ok:..., reply/error, usage}      exactly one, at the end
+    In confirm mode the guard hook blocks each Bash call and calls back to
+    /api/hook/permission; request_permission pushes the request onto this run's
+    queue so it interleaves with claude's output stream."""
     proj = CONFIG["current"]
     if not os.path.isdir(proj):
         yield {"type": "final", "ok": False, "error": f"作業フォルダが存在しません: {proj}"}
         return
 
+    mode = mode if mode in TOOLS_BY_MODE else "advisory"
     model_alias = MODELS.get(model, MODELS[DEFAULT_MODEL])
-    edit_mode = mode == "edit"
+    hook_mode = mode in HOOK_MODES
+    run_id = uuid.uuid4().hex
     cmd = [
         CLI, "-p", prompt,
         "--output-format", "stream-json",
         "--include-partial-messages",
         "--verbose",
         "--append-system-prompt", PERSONA,
-        "--allowedTools", *(EDIT_TOOLS if edit_mode else ADVISORY_TOOLS),
+        "--allowedTools", *TOOLS_BY_MODE[mode],
         "--model", model_alias,
     ]
     env = None
-    if edit_mode:
-        # The guard hook is the enforcement boundary; TODOCHAT_PROJECT_ROOT tells
-        # it which folder writes must stay inside (matches this spawn's cwd).
+    if hook_mode:
+        # The guard hook is the enforcement boundary. The env vars tell it which
+        # folder writes must stay inside, which mode it's in (edit denies Bash;
+        # confirm asks), and how to reach us to request per-command approval.
         cmd += ["--settings", guard_settings_arg()]
-        env = dict(os.environ, TODOCHAT_PROJECT_ROOT=proj)
+        env = dict(
+            os.environ,
+            TODOCHAT_PROJECT_ROOT=proj,
+            TODOCHAT_MODE=mode,
+            TODOCHAT_RUN_ID=run_id,
+            TODOCHAT_PERM_URL=f"http://{HOST}:{PORT}/api/hook/permission",
+        )
     sid = SESSIONS.get(norm(proj)) if resume else None
     if sid:
         cmd += ["--resume", sid]
 
     try:
-        # stderr is merged into stdout: reading only one pipe avoids the
-        # classic subprocess deadlock (child blocks on a full stderr buffer
-        # while we're only draining stdout). Stray non-JSON lines are just
-        # skipped below.
+        # stderr is merged into stdout: reading only one pipe avoids the classic
+        # subprocess deadlock. Stray non-JSON lines are skipped below.
         proc = subprocess.Popen(
             cmd, cwd=proj, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -223,22 +292,48 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
         yield {"type": "final", "ok": False, "error": f"claude CLI が見つかりません: {CLI}"}
         return
 
-    timed_out = {"hit": False}
+    q = queue.Queue()
+    run = {"queue": q, "last": time.time(), "perm_pending": False, "timed_out": False, "proc": proc}
+    with RUNS_LOCK:
+        RUNS[run_id] = run
 
-    def _kill_on_timeout():
-        timed_out["hit"] = True
-        proc.kill()
+    def reader():
+        try:
+            for line in proc.stdout:
+                run["last"] = time.time()
+                line = line.strip()
+                if line:
+                    q.put(("line", line))
+        finally:
+            q.put(("done", None))
 
-    timer = threading.Timer(TIMEOUT_SEC, _kill_on_timeout)
-    timer.start()
+    def watchdog():
+        while proc.poll() is None:
+            time.sleep(5)
+            if run["perm_pending"]:
+                continue   # user is deciding -- don't count this as a hang
+            if time.time() - run["last"] > STREAM_INACTIVITY_TIMEOUT:
+                run["timed_out"] = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                return
+
+    threading.Thread(target=reader, daemon=True).start()
+    threading.Thread(target=watchdog, daemon=True).start()
+
     result_data = None
     try:
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
+        while True:
+            kind, payload = q.get()
+            if kind == "done":
+                break
+            if kind == "perm_request":
+                yield {"type": "permission_request", **payload}
                 continue
             try:
-                d = json.loads(line)
+                d = json.loads(payload)
             except json.JSONDecodeError:
                 continue
             t = d.get("type")
@@ -251,10 +346,15 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
             elif t == "result":
                 result_data = d
     finally:
-        timer.cancel()
-        proc.wait()
+        with RUNS_LOCK:
+            RUNS.pop(run_id, None)
+        if proc.poll() is None:   # client disconnected mid-stream, etc.
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
-    if timed_out["hit"]:
+    if run["timed_out"]:
         yield {"type": "final", "ok": False, "error": "応答がタイムアウトしました。もう一度お試しください。"}
         return
     if result_data is None:
@@ -360,6 +460,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "メッセージが空です。"})
                 return
             self._stream_ndjson(run_claude_stream(msg, resume=True, model=body.get("model"), mode=body.get("mode")))
+        elif self.path == "/api/hook/permission":
+            # Called by the guard hook subprocess (confirm mode). Blocks until
+            # the user answers, then returns the decision to the hook.
+            body = self._read_body()
+            decision = request_permission(body.get("run_id"), body.get("tool"), body.get("tool_input") or {})
+            self._send_json({"decision": decision})
+        elif self.path == "/api/permission-response":
+            # Called by the browser when the user clicks 許可 / 拒否.
+            body = self._read_body()
+            self._send_json(resolve_permission(body.get("id"), body.get("decision")))
         elif self.path == "/api/projects/add":
             self._send_json(add_project(self._read_body().get("path")))
         elif self.path == "/api/projects/switch":

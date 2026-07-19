@@ -37,29 +37,38 @@
   .spacer { flex: 1; }
   .status { font-size: 12px; color: var(--muted); min-width: 56px; text-align: right; }
 
-  /* edit-mode toggle */
+  /* permission-mode selector */
   .modewrap { display: flex; align-items: center; gap: 6px; font-size: 12px; }
-  .modewrap .badge {
-    padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border);
-    background: var(--panel2); color: var(--muted); user-select: none;
+  select#mode {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 8px; font: inherit; font-size: 12px; cursor: pointer;
   }
-  .modewrap .badge.on { color: #ffd479; border-color: #7a5a1a; background: #2a230f; }
-  .switch { position: relative; width: 38px; height: 20px; flex: none; }
-  .switch input { opacity: 0; width: 0; height: 0; }
-  .switch .slider {
-    position: absolute; inset: 0; background: var(--panel2); border: 1px solid var(--border);
-    border-radius: 999px; cursor: pointer; transition: background .2s ease;
-  }
-  .switch .slider::before {
-    content: ""; position: absolute; width: 14px; height: 14px; left: 2px; top: 2px;
-    background: var(--muted); border-radius: 50%; transition: transform .2s ease, background .2s ease;
-  }
-  .switch input:checked + .slider { background: #4a3512; border-color: #7a5a1a; }
-  .switch input:checked + .slider::before { transform: translateX(18px); background: #ffd479; }
+  select#mode.edit { color: #ffd479; border-color: #7a5a1a; }
+  select#mode.confirm { color: #7ee0a0; border-color: #2f7a4a; }
   .denials {
     align-self: flex-start; max-width: 90%; font-size: 12px; color: #ffb4bb;
     background: #3a1f24; border: 1px solid #5a2a30; border-radius: 8px; padding: 6px 10px;
   }
+
+  /* per-command approval card (confirm mode) */
+  .perm-card {
+    align-self: stretch; max-width: 92%; margin: 2px 0;
+    background: #211b0e; border: 1px solid #7a5a1a; border-radius: 10px; padding: 12px 14px;
+  }
+  .perm-head { font-size: 13px; font-weight: 600; color: #ffd479; margin-bottom: 8px; }
+  .perm-cmd {
+    background: var(--code); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; margin: 0 0 10px; font-family: Consolas, "Courier New", monospace;
+    font-size: 13px; color: var(--text); white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto;
+  }
+  .perm-actions { display: flex; gap: 8px; }
+  .perm-actions button { border: none; border-radius: 8px; padding: 7px 16px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .perm-allow { background: #2f7a4a; color: #eafff1; }
+  .perm-deny { background: #5a2a30; color: #ffd7db; }
+  .perm-actions button:disabled { opacity: .5; cursor: default; }
+  .perm-status { font-size: 13px; font-weight: 600; }
+  .perm-status.allow { color: #7ee0a0; }
+  .perm-status.deny { color: #ffb4bb; }
 
   /* token usage strip */
   #tokstrip {
@@ -133,11 +142,11 @@
     </div>
     <span class="spacer"></span>
     <div class="modewrap">
-      <span class="badge" id="modeBadge">🔒 助言のみ</span>
-      <label class="switch" title="編集モード（作業フォルダ内のファイル編集を許可）の切替">
-        <input type="checkbox" id="editMode">
-        <span class="slider"></span>
-      </label>
+      <select id="mode" title="AIに許可する操作の範囲">
+        <option value="advisory">🔒 助言のみ</option>
+        <option value="edit">✏️ 編集</option>
+        <option value="confirm" selected>▶️ 実行（都度確認）</option>
+      </select>
     </div>
     <span class="status" id="status">起動中…</span>
   </header>
@@ -171,34 +180,23 @@ const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 const statusEl = document.getElementById('status');
 const projSel = document.getElementById('proj');
-const editModeChk = document.getElementById('editMode');
-const modeBadge = document.getElementById('modeBadge');
+const modeSel = document.getElementById('mode');
 let busy = false;
 
-function currentMode(){ return editModeChk.checked ? 'edit' : 'advisory'; }
-function updateModeBadge(){
-  if (editModeChk.checked){
-    modeBadge.textContent = '✏️ 編集許可'; modeBadge.classList.add('on');
-    modeBadge.title = '作業フォルダ内のファイル編集(Edit/Write)のみ許可。フォルダ外への書込とシェル実行(Bash)は無効。';
-  } else {
-    modeBadge.textContent = '🔒 助言のみ'; modeBadge.classList.remove('on');
-    modeBadge.title = 'Read/Glob/Grepのみ許可（ファイル編集・コマンド実行なし）';
-  }
+const MODE_TITLES = {
+  advisory: 'Read/Glob/Grepのみ（ファイル編集・コマンド実行なし）',
+  edit: '作業フォルダ内のファイル編集(Edit/Write)を許可。シェル実行(Bash)は無効。フォルダ外への書込は拒否。',
+  confirm: 'ファイル編集に加え、シェル/アプリ実行(Bash)を1コマンドずつ許可を求めて実行。フォルダ外への書込は拒否。',
+};
+function currentMode(){ return modeSel.value; }
+function updateModeStyle(){
+  modeSel.classList.remove('edit', 'confirm');
+  if (modeSel.value === 'edit') modeSel.classList.add('edit');
+  else if (modeSel.value === 'confirm') modeSel.classList.add('confirm');
+  modeSel.title = MODE_TITLES[modeSel.value] || '';
 }
-editModeChk.addEventListener('change', () => {
-  if (editModeChk.checked){
-    const okGo = confirm(
-      '編集モードをオンにしますか？\n\n' +
-      'AIがこの作業フォルダ内のファイルを作成・編集できるようになります。\n' +
-      '・フォルダ外への書き込みは自動でブロックされます\n' +
-      '・シェル実行(Bash)は無効です\n' +
-      '・編集内容はGitで元に戻せます'
-    );
-    if (!okGo){ editModeChk.checked = false; }
-  }
-  updateModeBadge();
-});
-updateModeBadge();
+modeSel.addEventListener('change', updateModeStyle);
+updateModeStyle();
 
 // ---- token usage ----
 const totals = { prompt: 0, out: 0, cacheR: 0, cacheC: 0, cost: 0 };
@@ -296,9 +294,41 @@ function typingBubble(){
   log.appendChild(el); log.scrollTop = log.scrollHeight; return el;
 }
 function setBusy(b){
-  busy = b; input.disabled = b; sendBtn.disabled = b; projSel.disabled = b; editModeChk.disabled = b;
+  busy = b; input.disabled = b; sendBtn.disabled = b; projSel.disabled = b; modeSel.disabled = b;
   statusEl.textContent = b ? '考え中…' : '待機中';
   if (!b) input.focus();
+}
+// Approval card for confirm mode: shows the exact command and waits for the
+// user to allow/deny, posting the decision back so the paused command resumes.
+function permissionCard(ev){
+  const card = document.createElement('div');
+  card.className = 'perm-card';
+  const head = document.createElement('div');
+  head.className = 'perm-head';
+  head.textContent = ev.tool === 'Bash' ? '▶️ このコマンドを実行しますか？' : `▶️ ${ev.tool} を許可しますか？`;
+  const cmd = document.createElement('pre');
+  cmd.className = 'perm-cmd';
+  cmd.textContent = ev.command || JSON.stringify(ev.input || {}, null, 2);   // textContent = XSS-safe
+  const actions = document.createElement('div');
+  actions.className = 'perm-actions';
+  const allow = document.createElement('button'); allow.className = 'perm-allow'; allow.textContent = '許可';
+  const deny = document.createElement('button'); deny.className = 'perm-deny'; deny.textContent = '拒否';
+  actions.append(allow, deny);
+  card.append(head, cmd, actions);
+  log.appendChild(card); log.scrollTop = log.scrollHeight;
+  statusEl.textContent = '許可待ち…';
+
+  const decide = async (decision) => {
+    allow.disabled = true; deny.disabled = true;
+    try { await api('/api/permission-response', { id: ev.id, decision }); } catch (_) {}
+    const st = document.createElement('div');
+    st.className = 'perm-status ' + decision;
+    st.textContent = decision === 'allow' ? '✅ 許可しました' : '⛔ 拒否しました';
+    actions.replaceWith(st);
+    statusEl.textContent = '考え中…';
+  };
+  allow.onclick = () => decide('allow');
+  deny.onclick = () => decide('deny');
 }
 async function api(path, payload, method){
   const opt = { method: method || 'POST', headers: { 'Content-Type': 'application/json' } };
@@ -383,33 +413,52 @@ document.getElementById('delProj').addEventListener('click', async () => {
 // ---- init / send ----
 const modelSel = document.getElementById('model');
 
-// Drives one streamed request: shows typing dots until the first text chunk
-// arrives, then grows the bubble with live text, then swaps in the fully
-// rendered Markdown once the final result event lands.
+// Drives one streamed request. The reply can arrive in multiple text segments
+// separated by approval cards (confirm mode): each segment grows live as plain
+// text, then settles into rendered Markdown when the segment ends (a permission
+// request or the final event). `live` is the current bubble -- typing dots
+// until the first text chunk, then a text bubble.
 async function streamedTurn(path, payload, onFail){
-  const el = typingBubble();
-  let acc = '', started = false, final = null;
+  let live = null, liveIsText = false, liveText = '', final = null;
+  function ensureTyping(){ if (!live){ live = typingBubble(); liveIsText = false; } }
+  function textTarget(){
+    if (!live){ live = document.createElement('div'); live.className = 'msg ai'; log.appendChild(live); }
+    if (!liveIsText){ live.innerHTML = ''; liveIsText = true; liveText = ''; }
+    return live;
+  }
+  function finalizeLive(){
+    if (!live) return;
+    if (liveIsText && liveText.trim()) live.innerHTML = renderMarkdown(liveText);
+    else live.remove();
+    live = null; liveIsText = false; liveText = '';
+  }
+  ensureTyping();
   try {
     await apiStream(path, payload, (ev) => {
       if (ev.type === 'delta'){
-        if (!started){ el.innerHTML = ''; started = true; }
-        acc += ev.text;
-        el.textContent = acc;
+        const t = textTarget();
+        liveText += ev.text; t.textContent = liveText;
         log.scrollTop = log.scrollHeight;
+      } else if (ev.type === 'permission_request'){
+        finalizeLive();
+        permissionCard(ev);
+        ensureTyping();          // dots while the (approved) command runs / reply continues
       } else if (ev.type === 'final'){
         final = ev;
       }
     });
   } catch (e){
-    el.remove(); onFail('通信エラー: ' + e); return;
+    finalizeLive(); onFail('通信エラー: ' + e); return;
   }
+  // No text streamed (e.g. tool-only turn) but a final reply exists -> show it.
+  if (final && final.ok && !liveIsText && final.reply && final.reply.trim()){
+    textTarget().textContent = final.reply; liveText = final.reply;
+  }
+  finalizeLive();
   if (final && final.ok){
-    el.innerHTML = renderMarkdown(final.reply || acc);
-    log.scrollTop = log.scrollHeight;
     addUsage(final.usage);
     showDenials(final.usage && final.usage.permission_denials);
   } else {
-    el.remove();
     onFail((final && final.error) || '不明なエラー');
   }
 }
