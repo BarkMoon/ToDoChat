@@ -80,7 +80,13 @@ def ask_user(data):
 
 def main():
     try:
-        data = json.load(sys.stdin)
+        # Read stdin as raw bytes and decode UTF-8 explicitly. The CLI writes the
+        # hook payload as UTF-8, but sys.stdin uses the console/locale encoding
+        # (cp932 on Japanese Windows), so json.load(sys.stdin) mangles multibyte
+        # text -- e.g. a Japanese `git commit -m "..."` shows up garbled in the
+        # approval card. Reading the bytes and decoding UTF-8 keeps it intact.
+        raw = sys.stdin.buffer.read()
+        data = json.loads(raw.decode("utf-8", "replace"))
     except Exception:
         decide("deny", "フック入力の解析に失敗しました。")
     tool = data.get("tool_name", "")

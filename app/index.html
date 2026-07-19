@@ -34,6 +34,8 @@
     border-radius: 8px; width: 30px; height: 30px; font-size: 15px; cursor: pointer; line-height: 1; padding: 0;
   }
   .iconbtn:hover { border-color: var(--accent); }
+  .iconbtn.quit { color: #ffb4bb; }
+  .iconbtn.quit:hover { border-color: #f85149; background: #3a1f24; }
   .spacer { flex: 1; }
   .status { font-size: 12px; color: var(--muted); min-width: 56px; text-align: right; }
 
@@ -149,6 +151,7 @@
       </select>
     </div>
     <span class="status" id="status">起動中…</span>
+    <button class="iconbtn quit" id="quitBtn" title="ToDoChatを終了（サーバーを停止してウィンドウを閉じます）">✕</button>
   </header>
 
   <div id="tokstrip">
@@ -487,6 +490,35 @@ async function send(){
 input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
 input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
 sendBtn.addEventListener('click', send);
+
+// ---- auto-shutdown on window close + manual 終了 button ----
+// While this page is open it heartbeats /api/alive. On window close we beacon
+// /api/shutdown; the server then quits after a short grace period. A reload also
+// fires unload, but the freshly loaded page's heartbeat cancels that shutdown,
+// so only an actual close stops the server.
+let quitting = false;
+function beaconShutdown(){
+  if (quitting) return;                         // 終了 button already stopped it
+  try { navigator.sendBeacon('/api/shutdown'); } catch (_) {}
+}
+window.addEventListener('pagehide', beaconShutdown);
+window.addEventListener('beforeunload', beaconShutdown);
+function heartbeat(){ api('/api/alive', {}).catch(() => {}); }
+heartbeat();                                     // cancels a reload-armed shutdown
+setInterval(heartbeat, 4000);
+
+document.getElementById('quitBtn').addEventListener('click', async () => {
+  if (!confirm('ToDoChatを終了しますか？\nサーバーを停止し、ウィンドウを閉じます。')) return;
+  quitting = true;
+  try { await api('/api/quit', {}); } catch (_) {}
+  statusEl.textContent = '終了しました';
+  window.close();                                // closes the --app window if allowed
+  // If the browser refused window.close(), leave a clear notice behind.
+  document.body.innerHTML =
+    '<div style="height:100vh;display:flex;align-items:center;justify-content:center;'
+    + 'color:#9aa1ad;font:15px system-ui,sans-serif;text-align:center;padding:24px;">'
+    + 'ToDoChatを終了しました。<br>サーバーは停止済みです。このウィンドウを閉じて構いません。</div>';
+});
 
 (async () => { await loadProjects(); await init(); })();
 </script>

@@ -157,6 +157,62 @@ def resolve_permission(perm_id, decision):
     return {"ok": True}
 
 
+# --- shutdown-on-window-close plumbing --------------------------------------
+# The app window has no OS process tie to this server, so closing it would
+# otherwise leave the Python server (and the CLI it spawns) running. The page
+# heartbeats /api/alive while open and beacons /api/shutdown on unload; we then
+# shut down after a short grace period -- but abort if a fresh heartbeat arrives
+# in the meantime, so a reload (which also fires unload) does NOT kill us.
+SHUTDOWN_GRACE = 8.0          # seconds to wait after an unload beacon before quitting
+SHUTDOWN_LOCK = threading.Lock()
+_shutdown_timer = None
+_arm_time = 0.0
+_last_alive = 0.0
+_SERVER = None                # set in main()
+
+
+def note_alive():
+    """A page is open and beating. Records the time so an armed shutdown that
+    was triggered by a reload's unload gets cancelled when the new page loads."""
+    global _last_alive
+    _last_alive = time.time()
+
+
+def arm_shutdown():
+    """An unload beacon arrived (window closed OR reloaded). Schedule a shutdown
+    check after the grace period; it only fires if no page checked in since."""
+    global _shutdown_timer, _arm_time
+    with SHUTDOWN_LOCK:
+        _arm_time = time.time()
+        if _shutdown_timer is not None:
+            _shutdown_timer.cancel()
+        _shutdown_timer = threading.Timer(SHUTDOWN_GRACE, _shutdown_check)
+        _shutdown_timer.daemon = True
+        _shutdown_timer.start()
+
+
+def _shutdown_check():
+    # A heartbeat after we armed means a page is still alive (a reload) -> abort.
+    if _last_alive > _arm_time:
+        return
+    stop_server()
+
+
+def stop_server():
+    """Kill any in-flight CLI processes and stop the HTTP server, ending the
+    process. Safe to call from a timer/other thread (not serve_forever's)."""
+    with RUNS_LOCK:
+        procs = [r.get("proc") for r in RUNS.values()]
+    for p in procs:
+        try:
+            if p and p.poll() is None:
+                p.kill()
+        except OSError:
+            pass
+    if _SERVER is not None:
+        threading.Thread(target=_SERVER.shutdown, daemon=True).start()
+
+
 # --- project management -----------------------------------------------------
 def list_projects():
     return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"]}
@@ -532,6 +588,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(remove_project(self._read_body().get("path")))
         elif self.path == "/api/projects/browse":
             self._send_json(browse_folder())
+        elif self.path == "/api/alive":
+            # Heartbeat from an open page; also cancels a reload-armed shutdown.
+            note_alive()
+            self._send_json({"ok": True})
+        elif self.path == "/api/shutdown":
+            # sendBeacon on window unload -> arm a graceful shutdown (a reload's
+            # fresh /api/alive cancels it; a real close lets it proceed).
+            arm_shutdown()
+            self._send_json({"ok": True})
+        elif self.path == "/api/quit":
+            # The 終了 button: stop immediately.
+            self._send_json({"ok": True})
+            stop_server()
         else:
             self.send_error(404)
 
@@ -588,6 +657,7 @@ def open_app_window(url):
 
 
 def main():
+    global _SERVER
     url = f"http://{HOST}:{PORT}/"
     # Reject a duplicate launch loudly instead of silently co-binding the port
     # (Windows SO_REUSEADDR would otherwise let two servers share port 8765).
@@ -599,6 +669,7 @@ def main():
         print(f"ウィンドウが見当たらない場合は {url} を開いてください。")
         open_app_window(url)
         return
+    _SERVER = server
     print(f"ToDoChat running at {url}")
     print(f"  CLI     : {CLI}")
     print(f"  current : {CONFIG['current']}")
