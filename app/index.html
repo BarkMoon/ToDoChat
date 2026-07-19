@@ -458,8 +458,13 @@ async function streamedTurn(path, payload, onFail){
   if (final && final.ok){
     addUsage(final.usage);
     showDenials(final.usage && final.usage.permission_denials);
+  } else if (final && final.error){
+    onFail(final.error);
   } else {
-    onFail((final && final.error) || '不明なエラー');
+    // No 'final' event ever arrived -> the stream was cut off before the server
+    // could report a result (server crash / killed process / dropped socket).
+    onFail('サーバーからの応答が途中で切断されました。'
+         + 'サーバー(start.bat)のウィンドウにエラー内容が表示されている場合があります。');
   }
 }
 async function init(){

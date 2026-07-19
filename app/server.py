@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -387,19 +388,56 @@ def init_greeting_stream(model=None, mode=None):
         f"作業対象フォルダ: {proj}\n\n"
         "以下はこのフォルダの TASKS.md の内容です:\n\n"
         f"{read_tasks(proj)}\n\n"
-        "起動時の第一声として、次の3点を短くまとめてください:\n"
-        "(1) 現状のタスク状況を1〜2文で要約\n"
-        "(2) 次に取り掛かるべきタスクを1つ提案\n"
-        "(3) 他に優先すべきことがないかユーザーへ一言問いかけ\n"
+        "起動時の第一声として、次のフォーマットに厳密に従って出力してください。\n"
+        "見出しタグは省略・変更せず、各見出しの下に内容を書いてください。\n\n"
+        "【現在のタスク状況】\n"
+        "(1〜2文で要約)\n\n"
+        "【次のタスク】\n"
+        "(次に取り掛かるべきタスクを1つ提案)\n\n"
+        "【確認】\n"
+        "(他に優先すべきことがないかユーザーへ一言問いかけ)\n\n"
         "TASKS.md が無い場合は、フォルダ内のコードやREADMEなどから状況を推測して要約してください。"
     )
     yield from run_claude_stream(prompt, resume=False, model=model, mode=mode)
 
 
 # --- HTTP handler -----------------------------------------------------------
+ERROR_LOG = APP_HOME / "server_error.log"
+
+
+def log_error(msg):
+    """Record an error to both the console and server_error.log. The launcher
+    window can close before the user reads it, so the file copy guarantees the
+    traceback survives and can be inspected afterwards."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = "[%s] %s" % (stamp, msg)
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def json_bytes(obj):
+    """Serialize a response object to UTF-8 bytes, never raising on content.
+
+    errors="replace" is essential: the claude CLI can emit lone surrogates or
+    otherwise un-encodable characters on Windows (e.g. a multibyte Japanese git
+    commit message that got mangled into a heredoc). A plain .encode("utf-8")
+    then raises UnicodeEncodeError mid-stream, which killed the whole response
+    before the final event was sent -- the browser only ever saw "不明なエラー".
+    Replacing the bad char keeps the JSON valid and the stream alive."""
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8", "replace")
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send_json(self, obj, code=200):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        body = json_bytes(obj)
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -417,19 +455,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def _stream_ndjson(self, events):
         """Stream a generator of dicts to the client as newline-delimited JSON,
-        flushing after each one so the browser sees deltas as they're produced."""
+        flushing after each one so the browser sees deltas as they're produced.
+
+        Any unexpected error is turned into a real 'final' error event (with the
+        traceback) and also printed to the server console -- never a silent
+        truncation, which the browser could only report as an opaque error."""
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+
+        def write(ev):
+            self.wfile.write(json_bytes(ev) + b"\n")
+            self.wfile.flush()
+
         try:
             for ev in events:
-                self.wfile.write((json.dumps(ev, ensure_ascii=False) + "\n").encode("utf-8"))
-                self.wfile.flush()
+                write(ev)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass  # client navigated away / closed the tab mid-stream
+        except Exception:
+            tb = traceback.format_exc()
+            log_error("stream error:\n" + tb)
+            try:   # best effort: tell the browser what actually went wrong
+                write({"type": "final", "ok": False,
+                       "error": "サーバー内部エラーが発生しました:\n" + tb})
+            except Exception:
+                pass  # connection is probably gone too; log still has the trace
 
     def do_GET(self):
         if self.path == "/api/projects":
