@@ -213,6 +213,7 @@
       </select>
     </div>
     <button class="pilltoggle" id="autoRemBtn" title="ウィンドウ終了時に、現在の状態を自動で記憶ログへ保存します（次回起動時に引き継がれます）">💾 終了時記憶<span class="sw" id="autoRemState">OFF</span></button>
+    <button class="pilltoggle" id="fullLogBtn" title="次回起動時、要約メモではなく前回の会話ログ全体を復元して再開します（深掘り作業向け）。毎ターン全履歴を再送するためトークン消費が大きくなります。">📜 フルログ復元<span class="sw" id="fullLogState">OFF</span></button>
     <span class="status" id="status">起動中…</span>
     <button class="iconbtn quit" id="quitBtn" title="ToDoChatを終了（サーバーを停止してウィンドウを閉じます）">✕</button>
   </header>
@@ -308,6 +309,31 @@ async function toggleAutoRemember(){
 }
 autoRemBtn.addEventListener('click', toggleAutoRemember);
 renderAutoRemember();
+
+// ---- full-log restore toggle ----
+// When ON, the NEXT launch resumes the whole prior conversation (via the CLI's
+// saved transcript) instead of the compact memory note -- heavier on tokens, so
+// it's opt-in and default OFF. Global (one setting for all folders), persisted
+// server-side (projects.json), so it restores its last state on next launch.
+const fullLogBtn = document.getElementById('fullLogBtn');
+const fullLogState = document.getElementById('fullLogState');
+let fullLog = false;
+function renderFullLog(){
+  fullLogBtn.classList.toggle('on', fullLog);
+  fullLogState.textContent = fullLog ? 'ON' : 'OFF';
+}
+async function toggleFullLog(){
+  const next = !fullLog;
+  fullLogBtn.disabled = true;
+  try {
+    const r = await api('/api/full-log', { enabled: next });
+    if (r.ok) fullLog = !!r.enabled;
+  } catch(_){}
+  renderFullLog();
+  fullLogBtn.disabled = false;
+}
+fullLogBtn.addEventListener('click', toggleFullLog);
+renderFullLog();
 
 // ---- token usage ----
 const totals = { prompt: 0, out: 0, cacheR: 0, cacheC: 0, cost: 0 };
@@ -493,6 +519,8 @@ async function loadProjects(){
     });
     autoRemember = !!data.auto_remember;   // restore last-saved toggle state
     renderAutoRemember();
+    fullLog = !!data.full_log;             // restore last-saved full-log choice
+    renderFullLog();
   } catch (_) {}
 }
 async function switchTo(path){
@@ -574,6 +602,12 @@ async function streamedTurn(path, payload, onFail){
         finalizeLive();
         permissionCard(ev);
         ensureTyping();          // dots while the (approved) command runs / reply continues
+      } else if (ev.type === 'notice'){
+        // A server-side status note mid-stream (e.g. full-log restore fell back
+        // to a fresh greeting). Show it as a sys bubble before the reply resumes.
+        finalizeLive();
+        bubble(ev.text, ev.cls || 'sys');
+        ensureTyping();
       } else if (ev.type === 'final'){
         final = ev;
       }

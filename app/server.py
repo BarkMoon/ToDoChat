@@ -119,7 +119,55 @@ def load_config():
 
 
 CONFIG = load_config()
-SESSIONS = {}   # norm(project_path) -> claude session_id (in-memory only)
+
+# --- session-id persistence (for the optional full-log restore mode) --------
+# SESSIONS maps norm(project_path) -> the CLI session_id of that project's live
+# conversation. We ALWAYS mirror it to disk (sessions.json), independently of the
+# full-log toggle, so that turning the toggle on and restarting can resume the
+# real conversation. The toggle only controls STARTUP behaviour (resume the saved
+# session vs. start fresh from the memory note) -- see init_greeting_stream.
+# The CLI keeps its own full transcript on disk keyed by session_id, so a saved
+# id stays resumable across server restarts; we only persist the pointer to it.
+SESSIONS_FILE = APP_HOME / ".todochat" / "sessions.json"
+
+
+def load_sessions():
+    try:
+        data = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if v}
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    return {}
+
+
+def save_sessions():
+    try:
+        SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SESSIONS_FILE.write_text(
+            json.dumps(SESSIONS, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def set_session(proj, sid):
+    """Record a project's live session_id in memory and mirror it to disk."""
+    if not sid:
+        return
+    SESSIONS[norm(proj)] = sid
+    save_sessions()
+
+
+def drop_session(proj):
+    """Forget a project's session both in memory and on disk (used by /clear and
+    project removal). No-op if there was nothing saved."""
+    key = norm(proj)
+    existed = SESSIONS.pop(key, None) is not None
+    if existed:
+        save_sessions()
+
+
+SESSIONS = load_sessions()   # norm(project_path) -> claude session_id (mirrored to sessions.json)
 
 # --- memory log (compact cross-restart hand-off note) -----------------------
 # We deliberately do NOT persist/replay the full CLI transcript across restarts
@@ -192,7 +240,7 @@ def clear_history(proj):
     """/clear: forget the live session pointer and delete this project's memory
     note (backing it up to TRASH first). The CLI's own transcript files are left
     on disk but are no longer referenced, so the next greeting starts fresh."""
-    SESSIONS.pop(norm(proj), None)
+    drop_session(proj)   # also removes the saved session_id (no stale full-log resume)
     p = memory_path(proj)
     had = p.exists()
     backup_memory(proj)
@@ -452,7 +500,8 @@ def stop_server():
 # --- project management -----------------------------------------------------
 def list_projects():
     return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"],
-            "auto_remember": bool(CONFIG.get("auto_remember"))}
+            "auto_remember": bool(CONFIG.get("auto_remember")),
+            "full_log": bool(CONFIG.get("full_log"))}
 
 
 def set_auto_remember(enabled):
@@ -461,6 +510,17 @@ def set_auto_remember(enabled):
     CONFIG["auto_remember"] = bool(enabled)
     save_config(CONFIG)
     return {"ok": True, "enabled": CONFIG["auto_remember"]}
+
+
+def set_full_log(enabled):
+    """Persist the 'full-log restore on startup' toggle into projects.json. Global
+    (one setting for all projects) and default OFF, so the last choice is restored
+    on the next launch. When ON, the opening greeting resumes the saved session
+    (full conversation in context) instead of the compact memory note -- heavier on
+    tokens, so it stays opt-in."""
+    CONFIG["full_log"] = bool(enabled)
+    save_config(CONFIG)
+    return {"ok": True, "enabled": CONFIG["full_log"]}
 
 
 def add_project(path):
@@ -489,7 +549,8 @@ def remove_project(path):
         CONFIG["projects"] = [{"path": str(APP_HOME), "name": APP_HOME.name}]
     if norm(CONFIG["current"]) == key:
         CONFIG["current"] = CONFIG["projects"][0]["path"]
-    SESSIONS.pop(key, None)
+    if SESSIONS.pop(key, None) is not None:
+        save_sessions()
     save_config(CONFIG)
     return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"]}
 
@@ -668,7 +729,7 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
 
     new_sid = result_data.get("session_id")
     if new_sid:
-        SESSIONS[norm(proj)] = new_sid
+        set_session(proj, new_sid)   # mirror to sessions.json for full-log restore
     reply, had_memory = apply_memory_block(proj, result_data.get("result", ""))
     yield {"type": "final", "ok": True, "reply": reply,
            "usage": extract_usage(result_data), "memory_saved": had_memory}
@@ -681,12 +742,54 @@ def read_tasks(d):
         return "(このフォルダに TASKS.md はありません)"
 
 
+# Light continuation prompt used only in full-log restore mode: the whole prior
+# conversation is already back in context via --resume, so we don't re-inject
+# TASKS.md or the memory note (that would double the tokens). We just ask for the
+# same 3-section opening so the UI looks identical to a normal launch.
+CONTINUE_PROMPT = (
+    "アプリを再起動し、前回までの会話の続きから再開します。"
+    "これまでの会話の文脈をふまえ、起動時の第一声として次のフォーマットに"
+    "厳密に従って出力してください。見出しタグは省略・変更しないでください。\n\n"
+    "【現在のタスク状況】\n"
+    "(1〜2文で要約)\n\n"
+    "【次のタスク】\n"
+    "(次に取り掛かるべきタスクを1つ提案)\n\n"
+    "【確認】\n"
+    "(他に優先すべきことがないかユーザーへ一言問いかけ)"
+)
+
+
 def init_greeting_stream(model=None, mode=None):
     proj = CONFIG["current"]
-    SESSIONS.pop(norm(proj), None)   # start a fresh conversation for this folder
     if not os.path.isdir(proj):
         yield {"type": "final", "ok": False, "error": f"作業フォルダが存在しません: {proj}"}
         return
+
+    # Full-log restore (opt-in, default OFF): if the toggle is on AND we have a
+    # saved session_id for this folder, resume the whole conversation instead of
+    # starting fresh from the compact memory note. Heavier on tokens, so it's
+    # opt-in. On any resume failure (stale/invalid id) fall back to a fresh
+    # greeting so a broken pointer never blocks startup.
+    if CONFIG.get("full_log") and SESSIONS.get(norm(proj)):
+        saw_delta = False
+        failed = False
+        for ev in run_claude_stream(CONTINUE_PROMPT, resume=True, model=model, mode=mode):
+            if ev.get("type") == "delta":
+                saw_delta = True
+                yield ev
+            elif ev.get("type") == "final" and not ev.get("ok") and not saw_delta:
+                failed = True   # resume errored before producing any text -> fall back
+                break
+            else:
+                yield ev
+        if not failed:
+            return
+        drop_session(proj)   # the saved id was unusable; don't retry it next time
+        yield {"type": "notice",
+               "text": "フルログを復元できなかったため、通常の起動に切り替えました。"}
+        # fall through to the fresh greeting below
+
+    SESSIONS.pop(norm(proj), None)   # start a fresh conversation for this folder
     mem = read_memory(proj)
     mem_section = (
         "以下は前回までの『引き継ぎメモ（記憶ログ）』です。"
@@ -860,6 +963,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/auto-remember":
             # Toggle "snapshot memory on window close"; persisted to projects.json.
             self._send_json(set_auto_remember(self._read_body().get("enabled")))
+        elif self.path == "/api/full-log":
+            # Toggle "resume the full conversation log on startup"; persisted.
+            self._send_json(set_full_log(self._read_body().get("enabled")))
         elif self.path == "/api/alive":
             # Heartbeat from an open page; also cancels a reload-armed shutdown.
             note_alive()
