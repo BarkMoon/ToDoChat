@@ -38,9 +38,19 @@ from pathlib import Path
 #   `  $(  ${   command / arithmetic substitution (can run anything)
 #   >  <  >>    redirection (can create or overwrite files)
 #   (  )  {  }  subshells / grouping / brace expansion
-#   newline     multiple statements on separate lines
-#   backslash   line continuation / escaping tricks
-_FORBIDDEN_SUBSTRINGS = ("`", "$(", "${", ">", "<", "(", ")", "{", "}", "\n", "\r", "\\")
+#   newline     multiple statements on separate lines / line continuation
+#
+# NOTE on backslash: `\` is deliberately NOT forbidden, so Windows-style paths
+# (`ls -la "C:\Users\me\proj"`) can still auto-approve. This is safe because
+# backslash cannot smuggle an unsafe action past the checks below: every other
+# forbidden character is matched as a LITERAL substring, so a `>` (or `` ` ``,
+# `$(`, ...) is still caught even if a backslash sits next to it; separators are
+# split on the RAW string (escaping only causes MORE splits, each of which must
+# still be safe); and shlex resolves an escaped program name to its real name
+# (`r\m` -> `rm`), which must be on the allowlist regardless. Line continuation
+# needs a trailing newline, which stays forbidden. An unbalanced backslash makes
+# shlex raise, and _segment_safe treats that as unsafe (fail closed).
+_FORBIDDEN_SUBSTRINGS = ("`", "$(", "${", ">", "<", "(", ")", "{", "}", "\n", "\r")
 
 # Sub-command separators. We split on these and check each piece; a lone `&`
 # (background execution) is rejected separately below.

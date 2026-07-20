@@ -42,6 +42,10 @@ PERSONA = (
     "ユーザーが隙間時間に即座に開発へ取り掛かれるよう支援します。"
     "常に日本語で、要点を先に、簡潔に答えます。"
     "先回りして次の具体的なアクションを1つ提案してください。"
+    "\n\n【コマンドの説明】シェルやアプリを実行する際、Bashツールの description "
+    "フィールドは必ず日本語で記述してください。これは実行確認カードに『意図・処理内容』"
+    "として表示され、ユーザーが許可/拒否を判断する材料になります。そのコマンドが"
+    "何をするのか（目的と処理内容）を簡潔な日本語で書いてください（英語で書かないこと）。"
     "\n\n【記憶ログ】アプリ再起動後も引き継ぐべき『進行中タスクの状態・決定事項・"
     "次の一手・重要なパスや事実』がある場合に限り、返信の一番最後に次の形式の"
     "記憶ブロックを1つだけ付けてください（引き継ぐことが無ければ付けない）:\n"
@@ -91,6 +95,21 @@ def guard_settings_arg():
 # values are the --model alias the CLI accepts ("opus"/"sonnet"/"haiku").
 MODELS = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku"}
 DEFAULT_MODEL = "sonnet"
+
+# Human-readable version names for the "which model did this work" memo, so a
+# commit message can credit the actual model (see the contributor-memo section).
+# Keyed by the same alias the UI sends. Kept next to MODELS so they stay in sync.
+MODEL_DISPLAY = {"opus": "Opus 4.8", "sonnet": "Sonnet 5", "haiku": "Haiku 4.5"}
+# Tools whose use means the model actually edited files (as opposed to read-only
+# advice/verification). Only these turns get credited in the contributor memo.
+EDIT_TOOL_NAMES = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+_GIT_COMMIT_RE = re.compile(r"\bgit\b[^\n&|;]*\bcommit\b")
+
+
+def _is_git_commit(command):
+    """True if a shell command line invokes `git commit` (used to clear the
+    contributor memo once its changes are committed)."""
+    return bool(_GIT_COMMIT_RE.search(command or ""))
 
 
 def norm(p):
@@ -179,6 +198,16 @@ SESSIONS = load_sessions()   # norm(project_path) -> claude session_id (mirrored
 MEMORY_DIR = APP_HOME / ".todochat" / "memory"   # active notes (server-managed, gitignored)
 TRASH_DIR = APP_HOME / ".todochat" / "trash"     # backups of deleted/overwritten notes
 MEMORY_RE = re.compile(r"\[\[TODOCHAT_MEMORY\]\](.*?)\[\[/TODOCHAT_MEMORY\]\]", re.DOTALL)
+
+# --- contributor memo (which models did the uncommitted work) ---------------
+# A tiny per-project list of the model display-names that DID implementation work
+# (design or an actual file edit) since the last commit. It is auto-appended when
+# a turn issues an Edit/Write, injected into later turns so the AI can credit the
+# right models in a commit message, and wiped when those changes are committed.
+# Read-only advice/verification turns are never credited (they issue no edits).
+# Like the memory notes it lives under ToDoChat's own .todochat/ (not the target
+# project), so it never leaks into the project being developed.
+MODELS_DIR = APP_HOME / ".todochat" / "models"   # per-project contributor lists (JSON)
 
 
 def memory_path(proj):
@@ -274,6 +303,92 @@ def write_memory(proj, text):
     except OSError as e:
         return {"ok": False, "error": f"保存に失敗しました: {e}"}
     return {"ok": True, "memory": read_memory(proj), "exists": bool(text)}
+
+
+def contributors_path(proj):
+    """Per-project contributor-memo file (same naming scheme as memory_path)."""
+    n = norm(proj)
+    h = hashlib.sha1(n.encode("utf-8")).hexdigest()[:8]
+    base = os.path.basename(os.path.normpath(str(proj))) or "root"
+    safe = re.sub(r"[^\w.-]", "_", base)[:40]
+    return MODELS_DIR / f"{safe}-{h}.json"
+
+
+def read_contributors(proj):
+    try:
+        data = json.loads(contributors_path(proj).read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [str(x) for x in data if str(x).strip()]
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    return []
+
+
+def save_contributors(proj, models):
+    """Write the list (deduped, order preserved). An empty list deletes the file."""
+    seen, out = set(), []
+    for m in models:
+        m = (m or "").strip()
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    p = contributors_path(proj)
+    try:
+        if out:
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        elif p.exists():
+            p.unlink()
+    except OSError:
+        pass
+    return out
+
+
+def add_contributor(proj, model_key):
+    """Credit a model (by UI alias) for editing files this turn. No-op for an
+    unknown alias or one already recorded."""
+    name = MODEL_DISPLAY.get(model_key)
+    if not name:
+        return
+    cur = read_contributors(proj)
+    if name not in cur:
+        save_contributors(proj, cur + [name])
+
+
+def clear_contributors(proj):
+    p = contributors_path(proj)
+    try:
+        if p.exists():
+            p.unlink()
+    except OSError:
+        pass
+
+
+def get_contributors(proj):
+    """Return the current project's contributor list for the viewer/editor UI."""
+    return {"ok": True, "models": read_contributors(proj)}
+
+
+def write_contributors_text(proj, text):
+    """Manual edit save from the editor UI: split on newlines/commas into a list
+    (blank clears the memo)."""
+    items = re.split(r"[\n,、]+", text or "")
+    return {"ok": True, "models": save_contributors(proj, items)}
+
+
+def contributor_commit_note(proj):
+    """A compact one-line reminder injected into a turn's prompt so the AI credits
+    the right models when it writes a commit message. Empty when nothing is
+    pending (so it costs no tokens outside active work)."""
+    models = read_contributors(proj)
+    if not models:
+        return ""
+    return (
+        "【使用モデル記録】現在の未コミットの変更に貢献したモデル: "
+        + "、".join(models) + "。"
+        "git commit を行う際は、CLAUDE.md のスタイル規約に従い、コミットメッセージ末尾の "
+        "(モデル名) にこれらを記載してください（複数なら『+』で連結）。この行はユーザーへ表示不要です。\n\n"
+    )
 
 
 # /remember: force a manual snapshot of the current session into the memory note
@@ -415,8 +530,14 @@ def request_permission(run_id, tool, tool_input):
     with PENDING_LOCK:
         PENDING_PERMS[perm_id] = {"event": ev, "decision": None}
     run["perm_pending"] = True   # pause the inactivity watchdog while the user thinks
+    # `description` is the CLI's own plain-language summary of the command's intent
+    # (Claude fills it into every Bash tool call); we surface it on the card so the
+    # user sees WHAT the command does and WHY, not just the raw shell line. Only
+    # needed here -- auto-approved safe commands don't get an explanation.
+    desc = tool_input.get("description", "") if isinstance(tool_input, dict) else ""
     run["queue"].put(("perm_request", {
         "id": perm_id, "tool": tool, "command": command, "input": tool_input,
+        "desc": desc,
     }))
     got = ev.wait(PERM_WAIT_TIMEOUT)
     run["perm_pending"] = False
@@ -424,7 +545,13 @@ def request_permission(run_id, tool, tool_input):
     with PENDING_LOCK:
         rec = PENDING_PERMS.pop(perm_id, None)
     decision = (rec or {}).get("decision") if got else None
-    return decision if decision in ("allow", "deny") else "deny"
+    decision = decision if decision in ("allow", "deny") else "deny"
+    # A committed change is now recorded; wipe the per-project "which models did
+    # the work" memo so the next batch of changes starts a fresh contributor list
+    # (the commit message the user just approved already carries the old names).
+    if decision == "allow" and tool == "Bash" and _is_git_commit(command):
+        clear_contributors(CONFIG["current"])
+    return decision
 
 
 def resolve_permission(perm_id, decision):
@@ -690,7 +817,7 @@ def extract_usage(data):
     }
 
 
-def run_claude_stream(prompt, resume=True, model=None, mode=None):
+def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib=False):
     """Generator yielding, as the reply is produced:
         {"type":"delta","text":...}                       streamed reply text
         {"type":"permission_request","id",...}            confirm mode: awaiting user approval
@@ -704,8 +831,13 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
         return
 
     mode = mode if mode in TOOLS_BY_MODE else "advisory"
-    model_alias = MODELS.get(model, MODELS[DEFAULT_MODEL])
+    model_key = model if model in MODELS else DEFAULT_MODEL
+    model_alias = MODELS[model_key]
     hook_mode = mode in HOOK_MODES
+    # Prepend the contributor reminder (real chat turns only) so the AI can credit
+    # the right models in any commit it writes. Empty unless work is pending.
+    if inject_contrib:
+        prompt = contributor_commit_note(proj) + prompt
     run_id = uuid.uuid4().hex
     cmd = [
         CLI, "-p", prompt,
@@ -777,6 +909,7 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
     threading.Thread(target=watchdog, daemon=True).start()
 
     result_data = None
+    did_edit = False   # did this turn actually issue a file-editing tool call?
     try:
         while True:
             kind, payload = q.get()
@@ -796,6 +929,13 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
                     delta = ev.get("delta") or {}
                     if delta.get("type") == "text_delta" and delta.get("text"):
                         yield {"type": "delta", "text": delta["text"]}
+            elif t == "assistant":
+                # Full assistant message: note if it edited files, to credit the
+                # model in the contributor memo (read-only turns issue no edits).
+                for block in ((d.get("message") or {}).get("content") or []):
+                    if (isinstance(block, dict) and block.get("type") == "tool_use"
+                            and block.get("name") in EDIT_TOOL_NAMES):
+                        did_edit = True
             elif t == "result":
                 result_data = d
     finally:
@@ -820,6 +960,8 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None):
     new_sid = result_data.get("session_id")
     if new_sid:
         set_session(proj, new_sid)   # mirror to sessions.json for full-log restore
+    if did_edit:
+        add_contributor(proj, model_key)   # credit this model for the file changes
     reply, had_memory = apply_memory_block(proj, result_data.get("result", ""))
     yield {"type": "final", "ok": True, "reply": reply,
            "usage": extract_usage(result_data), "memory_saved": had_memory}
@@ -1019,7 +1161,8 @@ class Handler(BaseHTTPRequestHandler):
             if not msg:
                 self._send_json({"ok": False, "error": "メッセージが空です。"})
                 return
-            self._stream_ndjson(run_claude_stream(msg, resume=True, model=body.get("model"), mode=body.get("mode")))
+            self._stream_ndjson(run_claude_stream(msg, resume=True, model=body.get("model"),
+                                                  mode=body.get("mode"), inject_contrib=True))
         elif self.path == "/api/hook/permission":
             # Called by the guard hook subprocess (confirm mode). Blocks until
             # the user answers, then returns the decision to the hook.
@@ -1041,6 +1184,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/memory/save":
             # Memory-editor 保存/削除: overwrite (or clear) the note by hand.
             self._send_json(write_memory(CONFIG["current"], self._read_body().get("text")))
+        elif self.path == "/api/models/get":
+            # Contributor-memo modal opened: return the current project's model list.
+            self._send_json(get_contributors(CONFIG["current"]))
+        elif self.path == "/api/models/save":
+            # Contributor-memo 保存/削除: overwrite (or clear) the model list by hand.
+            self._send_json(write_contributors_text(CONFIG["current"], self._read_body().get("text")))
         elif self.path == "/api/clear":
             # /clear typed in chat: drop the live session + delete the memory
             # note for the current project (a backup is kept in TRASH first).

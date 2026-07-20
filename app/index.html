@@ -73,6 +73,11 @@
     background: #211b0e; border: 1px solid #7a5a1a; border-radius: 10px; padding: 12px 14px;
   }
   .perm-head { font-size: 13px; font-weight: 600; color: #ffd479; margin-bottom: 8px; }
+  .perm-desc {
+    font-size: 12.5px; line-height: 1.5; color: #e6d9b8; margin: 0 0 8px;
+    padding-left: 8px; border-left: 2px solid #7a5a1a;
+  }
+  .perm-desc b { color: #ffd479; font-weight: 600; }
   .perm-cmd {
     background: var(--code); border: 1px solid var(--border); border-radius: 6px;
     padding: 8px 10px; margin: 0 0 10px; font-family: Consolas, "Courier New", monospace;
@@ -203,6 +208,7 @@
       <button class="iconbtn" id="addProj" title="フォルダを追加">＋</button>
       <button class="iconbtn" id="delProj" title="一覧から削除（フォルダは消えません）">🗑</button>
       <button class="iconbtn" id="memBtn" title="記憶ログ（引き継ぎメモ）を表示・編集">🧠</button>
+      <button class="iconbtn" id="modelsBtn" title="使用モデル記録（コミット時に参照する貢献モデル）を表示・編集">🏷️</button>
     </div>
     <span class="spacer"></span>
     <div class="modewrap">
@@ -259,6 +265,28 @@
         <span class="spacer"></span>
         <span class="mem-status" id="memStatus"></span>
         <button class="btn-primary" id="memSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modelsModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <span>🏷️ 使用モデル記録</span>
+        <span class="spacer"></span>
+        <button class="iconbtn" id="modelsClose" title="閉じる">✕</button>
+      </div>
+      <div class="modal-desc">
+        <b id="modelsProj">—</b> で<b>設計・実装（ファイル編集）を行ったモデル</b>の記録です。
+        <b>git commit 時にコミットメッセージへ自動で反映</b>され、コミット後にクリアされます。
+        1行に1モデルで自由に編集できます（例: <code>Opus 4.8</code>）。<b>空にして保存すると削除</b>されます。
+      </div>
+      <textarea id="modelsText" placeholder="（このフォルダの使用モデル記録はまだありません）" spellcheck="false"></textarea>
+      <div class="modal-actions">
+        <button class="btn-danger" id="modelsDelete">削除</button>
+        <span class="spacer"></span>
+        <span class="mem-status" id="modelsStatus"></span>
+        <button class="btn-primary" id="modelsSave">保存</button>
       </div>
     </div>
   </div>
@@ -493,12 +521,23 @@ function permissionCard(ev){
     log.appendChild(card); log.scrollTop = log.scrollHeight;
     return;
   }
+  // Manual approval: annotate WHAT the command does and WHY (the CLI's own
+  // description of its intent), so the decision isn't made off the raw line alone.
+  let desc = null;
+  if ((ev.desc || '').trim()){
+    desc = document.createElement('div');
+    desc.className = 'perm-desc';
+    const label = document.createElement('b'); label.textContent = '意図・処理内容: ';
+    desc.append(label, document.createTextNode(ev.desc.trim()));   // textContent-safe
+  }
   const actions = document.createElement('div');
   actions.className = 'perm-actions';
   const allow = document.createElement('button'); allow.className = 'perm-allow'; allow.textContent = '許可';
   const deny = document.createElement('button'); deny.className = 'perm-deny'; deny.textContent = '拒否';
   actions.append(allow, deny);
-  card.append(head, cmd, actions);
+  card.append(head);
+  if (desc) card.append(desc);
+  card.append(cmd, actions);
   log.appendChild(card); log.scrollTop = log.scrollHeight;
   statusEl.textContent = '許可待ち…';
 
@@ -762,6 +801,52 @@ memSaveBtn.addEventListener('click', saveMemory);
 memDelBtn.addEventListener('click', deleteMemory);
 memModal.addEventListener('click', (e) => { if (e.target === memModal) closeMemory(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !memModal.hidden) closeMemory(); });
+
+// ---- contributor memo viewer / editor (🏷️ button) ----
+// The list of models that did design/implementation (a file edit) since the last
+// commit, one per line. Auto-maintained by the server, but editable here; the AI
+// credits these in a commit message and the list is cleared once committed.
+const modelsModal = document.getElementById('modelsModal');
+const modelsText = document.getElementById('modelsText');
+const modelsStatus = document.getElementById('modelsStatus');
+const modelsSaveBtn = document.getElementById('modelsSave');
+const modelsDelBtn = document.getElementById('modelsDelete');
+function setModelsStatus(msg, cls){ modelsStatus.className = 'mem-status' + (cls ? ' ' + cls : ''); modelsStatus.textContent = msg || ''; }
+function modelsBusy(b){ modelsText.disabled = b; modelsSaveBtn.disabled = b; modelsDelBtn.disabled = b; }
+async function openModels(){
+  const opt = projSel.options[projSel.selectedIndex];
+  document.getElementById('modelsProj').textContent = opt ? opt.textContent : '現在のフォルダ';
+  modelsText.value = ''; setModelsStatus('読み込み中…'); modelsBusy(true);
+  modelsModal.hidden = false;
+  try {
+    const r = await api('/api/models/get', {});
+    if (r.ok){ const list = r.models || []; modelsText.value = list.join('\n'); setModelsStatus(list.length ? '' : '（まだ記録はありません）'); }
+    else setModelsStatus(r.error || '読み込みに失敗しました', 'err');
+  } catch(e){ setModelsStatus('読み込みに失敗: ' + e, 'err'); }
+  modelsBusy(false); modelsText.focus();
+}
+function closeModels(){ modelsModal.hidden = true; }
+async function saveModels(){
+  modelsBusy(true); setModelsStatus('保存中…');
+  try {
+    const r = await api('/api/models/save', { text: modelsText.value });
+    if (r.ok){ const list = r.models || []; modelsText.value = list.join('\n'); setModelsStatus(list.length ? '✓ 保存しました' : '✓ 空のため削除しました', 'ok'); }
+    else setModelsStatus(r.error || '保存に失敗しました', 'err');
+  } catch(e){ setModelsStatus('保存に失敗: ' + e, 'err'); }
+  modelsBusy(false);
+}
+async function deleteModels(){
+  if (!modelsText.value.trim()){ closeModels(); return; }
+  if (!confirm('この使用モデル記録を削除しますか？')) return;
+  modelsText.value = '';
+  await saveModels();
+}
+document.getElementById('modelsBtn').addEventListener('click', openModels);
+document.getElementById('modelsClose').addEventListener('click', closeModels);
+modelsSaveBtn.addEventListener('click', saveModels);
+modelsDelBtn.addEventListener('click', deleteModels);
+modelsModal.addEventListener('click', (e) => { if (e.target === modelsModal) closeModels(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modelsModal.hidden) closeModels(); });
 
 async function send(){
   const text = input.value.trim();
