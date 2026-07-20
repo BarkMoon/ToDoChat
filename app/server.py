@@ -523,6 +523,96 @@ def set_full_log(enabled):
     return {"ok": True, "enabled": CONFIG["full_log"]}
 
 
+STARTUP_TASK_NAME = "ToDoChat"
+
+
+# Windows error code returned when the user dismisses the UAC prompt.
+_UAC_CANCELLED = 1223
+
+
+def _schtasks(args):
+    """Run schtasks.exe unelevated and return (returncode, stdout, stderr).
+    Used for the read-only /query (which standard users are allowed to do)."""
+    try:
+        r = subprocess.run(["schtasks.exe", *args], capture_output=True,
+                            text=True, timeout=10)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 1, "", "schtasks.exe が見つかりません（Windows専用機能です）。"
+    except subprocess.TimeoutExpired:
+        return 1, "", "schtasksの実行がタイムアウトしました。"
+
+
+def _schtasks_elevated(argstr):
+    """Run `schtasks <argstr>` elevated via a one-shot UAC prompt and return its
+    exit code. Creating/deleting a Task Scheduler task needs admin rights even
+    with /rl limited, so we self-elevate only for this click (PowerShell
+    Start-Process -Verb RunAs) rather than running the whole app as admin. The
+    argstr is passed as a single verbatim argument line so schtasks' own quoting
+    (e.g. the quoted /tr path) survives Start-Process untouched.
+
+    Returns _UAC_CANCELLED if the user dismisses the UAC dialog. Only the exit
+    code is available (the elevated process is a separate hidden window), so
+    callers map non-zero to a generic failure message."""
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "try {"
+        f"  $p = Start-Process -FilePath schtasks.exe -ArgumentList '{argstr}'"
+        "   -Verb RunAs -Wait -PassThru -WindowStyle Hidden;"
+        "  exit $p.ExitCode"
+        "} catch {"
+        f"  exit {_UAC_CANCELLED}"
+        "}"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=120)
+        return r.returncode
+    except FileNotFoundError:
+        return -1
+    except subprocess.TimeoutExpired:
+        return -2
+
+
+def get_startup_status():
+    code, _, _ = _schtasks(["/query", "/tn", STARTUP_TASK_NAME])
+    return {"ok": True, "registered": code == 0}
+
+
+def register_startup():
+    """Register a log-on-trigger Task Scheduler task that runs start.bat, so
+    ToDoChat launches automatically at Windows sign-in. The task itself runs
+    with /rl limited (standard-user privileges) — only creating it needs the
+    one-time UAC elevation below."""
+    bat = APP_HOME / "start.bat"
+    if not bat.is_file():
+        return {"ok": False, "error": f"start.bat が見つかりません: {bat}"}
+    # schtasks /tr wants the program path double-quoted (spaces in the install
+    # path); the \" escapes keep those quotes literal inside PowerShell's
+    # single-quoted ArgumentList string.
+    argstr = (f'/create /tn {STARTUP_TASK_NAME} /tr "\\"{bat}\\"" '
+              f'/sc onlogon /rl limited /f')
+    code = _schtasks_elevated(argstr)
+    if code == _UAC_CANCELLED:
+        return {"ok": False, "cancelled": True,
+                "error": "登録がキャンセルされました（管理者の許可が必要です）。"}
+    if code != 0:
+        return {"ok": False, "error": f"登録に失敗しました（コード {code}）。"}
+    return {"ok": True, "registered": True}
+
+
+def unregister_startup():
+    argstr = f"/delete /tn {STARTUP_TASK_NAME} /f"
+    code = _schtasks_elevated(argstr)
+    if code == _UAC_CANCELLED:
+        return {"ok": False, "cancelled": True,
+                "error": "解除がキャンセルされました（管理者の許可が必要です）。"}
+    if code != 0:
+        return {"ok": False, "error": f"解除に失敗しました（コード {code}）。"}
+    return {"ok": True, "registered": False}
+
+
 def add_project(path):
     p = os.path.abspath(os.path.expanduser((path or "").strip().strip('"')))
     if not p or not os.path.isdir(p):
@@ -902,6 +992,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/projects":
             self._send_json(list_projects())
             return
+        if self.path == "/api/startup/status":
+            self._send_json(get_startup_status())
+            return
         if self.path in ("/", "/index.html"):
             try:
                 html = (APP_DIR / "index.html").read_bytes()
@@ -966,6 +1059,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/full-log":
             # Toggle "resume the full conversation log on startup"; persisted.
             self._send_json(set_full_log(self._read_body().get("enabled")))
+        elif self.path == "/api/startup/register":
+            self._send_json(register_startup())
+        elif self.path == "/api/startup/unregister":
+            self._send_json(unregister_startup())
         elif self.path == "/api/alive":
             # Heartbeat from an open page; also cancels a reload-armed shutdown.
             note_alive()
