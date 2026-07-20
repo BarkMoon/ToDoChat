@@ -23,6 +23,7 @@
   }
   header .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); flex: none; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; flex: none; }
+  header .ver { font-size: 11px; color: var(--muted, #888); flex: none; opacity: .8; font-variant-numeric: tabular-nums; }
   .projwrap { display: flex; align-items: center; gap: 6px; }
   .projwrap .lbl { font-size: 12px; color: var(--muted); }
   select#proj {
@@ -202,6 +203,7 @@
   <header>
     <span class="dot"></span>
     <h1>ToDoChat</h1>
+    <span class="ver" id="ver" title="アプリのバージョン（括弧内はコミット。+は未コミットの変更あり）"></span>
     <div class="projwrap">
       <span class="lbl">📁</span>
       <select id="proj" title="開発対象フォルダ"></select>
@@ -592,6 +594,7 @@ async function loadProjects(){
       if (p.path === data.current) o.selected = true;
       projSel.appendChild(o);
     });
+    if (data.version) document.getElementById('ver').textContent = 'v' + data.version;
     autoRemember = !!data.auto_remember;   // restore last-saved toggle state
     renderAutoRemember();
     fullLog = !!data.full_log;             // restore last-saved full-log choice

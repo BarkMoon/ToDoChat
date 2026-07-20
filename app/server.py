@@ -26,6 +26,11 @@ from pathlib import Path
 
 from safe_shell import is_safe_command   # read-only-command allowlist (auto-approve)
 
+# --- version ----------------------------------------------------------------
+# SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
+# features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
+APP_VERSION = "0.7.0"
+
 # --- paths / config ---------------------------------------------------------
 HOST = "127.0.0.1"
 PORT = 8765
@@ -624,11 +629,34 @@ def stop_server():
         threading.Thread(target=_SERVER.shutdown, daemon=True).start()
 
 
+# --- version ----------------------------------------------------------------
+def version_string():
+    """Display version. In a git checkout, append a dev identifier: the short
+    commit hash plus a '+' marker when there are uncommitted changes
+    (e.g. '0.7.0 (a4305a8)' committed, '0.7.0 (a4305a8+)' with local edits).
+    Outside git, returns the bare version."""
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(APP_HOME), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3)
+        if head.returncode != 0:
+            return APP_VERSION
+        commit = head.stdout.strip()
+        dirty = subprocess.run(
+            ["git", "-C", str(APP_HOME), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=3)
+        mark = "+" if dirty.stdout.strip() else ""
+        return f"{APP_VERSION} ({commit}{mark})"
+    except (OSError, subprocess.TimeoutExpired):
+        return APP_VERSION
+
+
 # --- project management -----------------------------------------------------
 def list_projects():
     return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"],
             "auto_remember": bool(CONFIG.get("auto_remember")),
-            "full_log": bool(CONFIG.get("full_log"))}
+            "full_log": bool(CONFIG.get("full_log")),
+            "version": version_string()}
 
 
 def set_auto_remember(enabled):
