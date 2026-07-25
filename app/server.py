@@ -29,7 +29,7 @@ from safe_shell import is_safe_command   # read-only-command allowlist (auto-app
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.7.1"
+APP_VERSION = "0.7.2"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -222,6 +222,17 @@ MEMORY_RE = re.compile(r"\[\[TODOCHAT_MEMORY\]\](.*?)\[\[/TODOCHAT_MEMORY\]\]", 
 # project), so it never leaks into the project being developed.
 MODELS_DIR = APP_HOME / ".todochat" / "models"   # per-project contributor lists (JSON)
 
+# --- cross-device transcript (for the 🔄 sync button) -----------------------
+# A per-project rolling log of the VISIBLE conversation (user + AI text only),
+# so a chat started on one device (e.g. phone) can be pulled up and continued on
+# another (e.g. PC) that hits the same server. The AI's context continuity is
+# already shared server-side (session_id + memory note); this only fills the gap
+# of the visible bubbles, which otherwise live solely in each browser's DOM.
+# Capped to the most recent turns so the file can't grow without bound. Lives
+# under ToDoChat's own .todochat/ (gitignored), never the target project.
+TRANSCRIPTS_DIR = APP_HOME / ".todochat" / "transcripts"
+MAX_TRANSCRIPT_TURNS = 200
+
 
 def memory_path(proj):
     """Per-project memory file. Named from the folder's basename plus a short
@@ -283,6 +294,7 @@ def clear_history(proj):
     note (backing it up to TRASH first). The CLI's own transcript files are left
     on disk but are no longer referenced, so the next greeting starts fresh."""
     drop_session(proj)   # also removes the saved session_id (no stale full-log resume)
+    clear_transcript(proj)   # the cross-device chat mirror goes too
     p = memory_path(proj)
     had = p.exists()
     backup_memory(proj)
@@ -402,6 +414,59 @@ def contributor_commit_note(proj):
         "git commit を行う際は、CLAUDE.md のスタイル規約に従い、コミットメッセージ末尾の "
         "(モデル名) にこれらを記載してください（複数なら『+』で連結）。この行はユーザーへ表示不要です。\n\n"
     )
+
+
+def transcript_path(proj):
+    """Per-project transcript file (same naming scheme as memory_path)."""
+    n = norm(proj)
+    h = hashlib.sha1(n.encode("utf-8")).hexdigest()[:8]
+    base = os.path.basename(os.path.normpath(str(proj))) or "root"
+    safe = re.sub(r"[^\w.-]", "_", base)[:40]
+    return TRANSCRIPTS_DIR / f"{safe}-{h}.json"
+
+
+def read_transcript(proj):
+    """Return this project's stored conversation as a list of
+    {"role": "user"|"ai", "text": str, "ts": float}."""
+    try:
+        data = json.loads(transcript_path(proj).read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return [d for d in data if isinstance(d, dict) and d.get("text")]
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    return []
+
+
+def append_transcript(proj, role, text):
+    """Append one turn to the project's transcript, trimming to the most recent
+    MAX_TRANSCRIPT_TURNS. Best-effort: never raises into the streaming path."""
+    text = (text or "").strip()
+    if not text:
+        return
+    items = read_transcript(proj)
+    items.append({"role": role, "text": text, "ts": time.time()})
+    if len(items) > MAX_TRANSCRIPT_TURNS:
+        items = items[-MAX_TRANSCRIPT_TURNS:]
+    try:
+        TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        transcript_path(proj).write_text(
+            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_transcript(proj):
+    """Delete a project's transcript (used by /clear). No backup: it's a
+    convenience mirror of chat bubbles, not authored content."""
+    try:
+        transcript_path(proj).unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def get_transcript(proj):
+    """Return the stored transcript for the 🔄 sync button to replay."""
+    return {"ok": True, "turns": read_transcript(proj)}
 
 
 # /remember: force a manual snapshot of the current session into the memory note
@@ -664,6 +729,7 @@ def list_projects():
     return {"ok": True, "current": CONFIG["current"], "projects": CONFIG["projects"],
             "auto_remember": bool(CONFIG.get("auto_remember")),
             "full_log": bool(CONFIG.get("full_log")),
+            "enter_to_send": bool(CONFIG.get("enter_to_send")),
             "version": version_string()}
 
 
@@ -684,6 +750,16 @@ def set_full_log(enabled):
     CONFIG["full_log"] = bool(enabled)
     save_config(CONFIG)
     return {"ok": True, "enabled": CONFIG["full_log"]}
+
+
+def set_enter_to_send(enabled):
+    """Persist the Enter-key behaviour into projects.json. Default (False) means
+    Enter inserts a newline and Ctrl+Enter sends -- chosen to avoid accidental
+    sends (especially mid-IME-composition and on phones). True restores the
+    classic Enter-sends / Shift+Enter-newline behaviour."""
+    CONFIG["enter_to_send"] = bool(enabled)
+    save_config(CONFIG)
+    return {"ok": True, "enabled": CONFIG["enter_to_send"]}
 
 
 STARTUP_TASK_NAME = "ToDoChat"
@@ -1082,6 +1158,19 @@ def init_greeting_stream(model=None, mode=None):
     yield from run_claude_stream(prompt, resume=False, model=model, mode=mode)
 
 
+def recording_stream(proj, gen, user_text=None):
+    """Wrap a chat/init event generator so the visible conversation is mirrored
+    into the project's transcript (for the 🔄 cross-device sync). Records the
+    user's message up front and the AI's memory-stripped reply when the turn
+    finishes. Recording is best-effort and never interferes with the stream."""
+    if user_text:
+        append_transcript(proj, "user", user_text)
+    for ev in gen:
+        if ev.get("type") == "final" and ev.get("ok"):
+            append_transcript(proj, "ai", ev.get("reply", ""))
+        yield ev
+
+
 # --- HTTP handler -----------------------------------------------------------
 ERROR_LOG = APP_HOME / "server_error.log"
 
@@ -1190,15 +1279,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/init":
             body = self._read_body()
-            self._stream_ndjson(init_greeting_stream(model=body.get("model"), mode=body.get("mode")))
+            proj = CONFIG["current"]
+            self._stream_ndjson(recording_stream(
+                proj, init_greeting_stream(model=body.get("model"), mode=body.get("mode"))))
         elif self.path == "/api/chat":
             body = self._read_body()
             msg = (body.get("message") or "").strip()
             if not msg:
                 self._send_json({"ok": False, "error": "メッセージが空です。"})
                 return
-            self._stream_ndjson(run_claude_stream(msg, resume=True, model=body.get("model"),
-                                                  mode=body.get("mode"), inject_contrib=True))
+            proj = CONFIG["current"]
+            self._stream_ndjson(recording_stream(
+                proj,
+                run_claude_stream(msg, resume=True, model=body.get("model"),
+                                  mode=body.get("mode"), inject_contrib=True),
+                user_text=msg))
         elif self.path == "/api/hook/permission":
             # Called by the guard hook subprocess (confirm mode). Blocks until
             # the user answers, then returns the decision to the hook.
@@ -1244,6 +1339,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/full-log":
             # Toggle "resume the full conversation log on startup"; persisted.
             self._send_json(set_full_log(self._read_body().get("enabled")))
+        elif self.path == "/api/enter-mode":
+            # Toggle Enter-key behaviour (Enter sends vs. Ctrl+Enter sends); persisted.
+            self._send_json(set_enter_to_send(self._read_body().get("enabled")))
+        elif self.path == "/api/transcript/get":
+            # 🔄 sync button: return the current project's cross-device transcript.
+            self._send_json(get_transcript(CONFIG["current"]))
         elif self.path == "/api/startup/register":
             self._send_json(register_startup())
         elif self.path == "/api/startup/unregister":

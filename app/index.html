@@ -197,6 +197,22 @@
   }
   .btn-danger:hover { border-color: #f85149; }
   .btn-danger:disabled { opacity: .5; cursor: default; }
+
+  /* settings modal rows */
+  .set-body { padding: 8px 16px 16px; display: flex; flex-direction: column; gap: 6px; }
+  .set-row {
+    display: flex; align-items: center; gap: 14px; padding: 12px 2px;
+    border-bottom: 1px solid var(--border);
+  }
+  .set-row:last-child { border-bottom: none; }
+  .set-label { flex: 1; min-width: 0; }
+  .set-title { font-size: 14px; color: var(--text); margin-bottom: 3px; }
+  .set-note { font-size: 12px; color: var(--muted); line-height: 1.5; }
+  .set-row select {
+    flex: none; background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 12px; cursor: pointer; max-width: 55%;
+  }
+  .set-row select:focus { outline: none; border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -211,6 +227,7 @@
       <button class="iconbtn" id="delProj" title="一覧から削除（フォルダは消えません）">🗑</button>
       <button class="iconbtn" id="memBtn" title="記憶ログ（引き継ぎメモ）を表示・編集">🧠</button>
       <button class="iconbtn" id="modelsBtn" title="使用モデル記録（コミット時に参照する貢献モデル）を表示・編集">🏷️</button>
+      <button class="iconbtn" id="syncBtn" title="他の端末（スマホ⇔PC）で行った会話を読み込んで同期します">🔄</button>
     </div>
     <span class="spacer"></span>
     <div class="modewrap">
@@ -222,7 +239,7 @@
     </div>
     <button class="pilltoggle" id="autoRemBtn" title="ウィンドウ終了時に、現在の状態を自動で記憶ログへ保存します（次回起動時に引き継がれます）">💾 終了時記憶<span class="sw" id="autoRemState">OFF</span></button>
     <button class="pilltoggle" id="fullLogBtn" title="次回起動時、要約メモではなく前回の会話ログ全体を復元して再開します（深掘り作業向け）。毎ターン全履歴を再送するためトークン消費が大きくなります。">📜 フルログ復元<span class="sw" id="fullLogState">OFF</span></button>
-    <button class="pilltoggle" id="startupBtn" title="Windowsサインイン時にToDoChatを自動起動します（タスクスケジューラに登録）。">🚀 スタートアップ登録<span class="sw" id="startupState">…</span></button>
+    <button class="iconbtn" id="settingsBtn" title="設定（改行キー・スタートアップ登録）">⚙️</button>
     <span class="status" id="status">起動中…</span>
     <button class="iconbtn quit" id="quitBtn" title="ToDoChatを終了（サーバーを停止してウィンドウを閉じます）">✕</button>
   </header>
@@ -245,7 +262,7 @@
       </select>
     </div>
     <div class="row">
-      <textarea id="input" placeholder="返信を入力（Enter送信 / Shift+Enter改行 / /remember で記憶を保存 / /clear で消去）" disabled></textarea>
+      <textarea id="input" placeholder="返信を入力（Enterで改行 / Ctrl+Enter送信 / /remember で記憶を保存 / /clear で消去）" disabled></textarea>
       <button class="send" id="send" disabled>送信</button>
     </div>
   </footer>
@@ -289,6 +306,35 @@
         <span class="spacer"></span>
         <span class="mem-status" id="modelsStatus"></span>
         <button class="btn-primary" id="modelsSave">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="settingsModal" class="modal-overlay" hidden>
+    <div class="modal">
+      <div class="modal-head">
+        <span>⚙️ 設定</span>
+        <span class="spacer"></span>
+        <button class="iconbtn" id="settingsClose" title="閉じる">✕</button>
+      </div>
+      <div class="set-body">
+        <div class="set-row">
+          <div class="set-label">
+            <div class="set-title">入力欄のEnterキー</div>
+            <div class="set-note">誤送信を避けたい場合は「Enterで改行」を選びます。スマホでもEnterで改行できます。</div>
+          </div>
+          <select id="enterModeSel" title="入力欄でEnterを押したときの動作">
+            <option value="newline">Enterで改行 / Ctrl+Enterで送信（推奨）</option>
+            <option value="send">Enterで送信 / Shift+Enterで改行</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <div class="set-title">Windowsスタートアップ登録</div>
+            <div class="set-note">Windowsサインイン時にToDoChatを自動起動します（タスクスケジューラに登録。切替時に管理者確認が出ます）。</div>
+          </div>
+          <button class="pilltoggle" id="startupBtn" title="Windowsサインイン時にToDoChatを自動起動します（タスクスケジューラに登録）。">🚀 登録<span class="sw" id="startupState">…</span></button>
+        </div>
       </div>
     </div>
   </div>
@@ -599,6 +645,8 @@ async function loadProjects(){
     renderAutoRemember();
     fullLog = !!data.full_log;             // restore last-saved full-log choice
     renderFullLog();
+    enterToSend = !!data.enter_to_send;    // restore Enter-key behaviour
+    renderEnterMode();
   } catch (_) {}
 }
 async function switchTo(path){
@@ -864,9 +912,80 @@ async function send(){
   setBusy(false);
 }
 
-input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); } });
+// ---- Enter-key behaviour (settings) ----
+// Default (enterToSend=false): Enter inserts a newline, Ctrl/Cmd+Enter sends.
+// This avoids accidental sends -- notably it never fires while a Japanese IME is
+// still composing (e.isComposing), and on phones Enter just makes a newline.
+// enterToSend=true restores the classic Enter-sends / Shift+Enter-newline mode.
+let enterToSend = false;
+function updateInputHint(){
+  const keyHint = enterToSend ? 'Enter送信 / Shift+Enter改行' : 'Enterで改行 / Ctrl+Enter送信';
+  input.placeholder = `返信を入力（${keyHint} / /remember で記憶を保存 / /clear で消去）`;
+}
+function renderEnterMode(){
+  if (enterModeSel) enterModeSel.value = enterToSend ? 'send' : 'newline';
+  updateInputHint();
+}
+input.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || e.isComposing) return;   // never send mid-IME-composition
+  if (enterToSend){
+    if (!e.shiftKey){ e.preventDefault(); send(); }
+  } else if (e.ctrlKey || e.metaKey){
+    e.preventDefault(); send();
+  }
+  // plain Enter in newline mode: fall through -> the textarea inserts a newline
+});
 input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 160) + 'px'; });
 sendBtn.addEventListener('click', send);
+
+// ---- settings modal (⚙️): Enter-key behaviour + Windows startup registration ----
+const settingsModal = document.getElementById('settingsModal');
+const enterModeSel = document.getElementById('enterModeSel');
+function openSettings(){ settingsModal.hidden = false; }
+function closeSettings(){ settingsModal.hidden = true; }
+enterModeSel.addEventListener('change', async () => {
+  const next = enterModeSel.value === 'send';
+  enterModeSel.disabled = true;
+  try {
+    const r = await api('/api/enter-mode', { enabled: next });
+    if (r.ok) enterToSend = !!r.enabled;
+  } catch(_){}
+  renderEnterMode();
+  enterModeSel.disabled = false;
+});
+document.getElementById('settingsBtn').addEventListener('click', openSettings);
+document.getElementById('settingsClose').addEventListener('click', closeSettings);
+settingsModal.addEventListener('click', (e) => { if (e.target === settingsModal) closeSettings(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !settingsModal.hidden) closeSettings(); });
+renderEnterMode();
+
+// ---- cross-device sync (🔄): pull the transcript recorded server-side and
+// replay it into this browser, so a conversation started on another device
+// (phone <-> PC, all talking to the same server) shows up here to continue.
+async function syncTranscript(){
+  if (busy) return;
+  const syncBtn = document.getElementById('syncBtn');
+  syncBtn.disabled = true;
+  const prev = statusEl.textContent;
+  statusEl.textContent = '同期中…';
+  try {
+    const r = await api('/api/transcript/get', {});
+    const turns = (r && r.turns) || [];
+    if (!turns.length){
+      bubble('同期できる会話履歴がありません。（このフォルダではまだ会話が記録されていません）', 'sys');
+      return;
+    }
+    log.innerHTML = ''; resetContextBar();
+    bubble('── 他の端末を含む会話を同期しました ──', 'sys');
+    turns.forEach(t => bubble(t.text, t.role === 'user' ? 'user' : 'ai'));
+    bubble('この続きから入力できます。（AIの文脈は記憶ログ経由で引き継がれます）', 'sys');
+  } catch(e){ bubble('同期に失敗しました: ' + e, 'err'); }
+  finally {
+    statusEl.textContent = prev;
+    syncBtn.disabled = false;
+  }
+}
+document.getElementById('syncBtn').addEventListener('click', syncTranscript);
 
 // ---- auto-shutdown on window close + manual 終了 button ----
 // While this page is open it heartbeats /api/alive. On window close we beacon
