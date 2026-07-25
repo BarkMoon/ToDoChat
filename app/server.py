@@ -29,11 +29,19 @@ from safe_shell import is_safe_command   # read-only-command allowlist (auto-app
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.7.1"
 
 # --- paths / config ---------------------------------------------------------
+# HOST is the local-facing address used for the in-app window and for the hook
+# callback URL (edit_guard / permission hooks connect from a local subprocess),
+# so it must stay a loopback address. BIND_HOST is what the HTTP server actually
+# listens on: set env TODOCHAT_HOST=0.0.0.0 to also accept LAN clients (e.g. a
+# phone on the same Wi-Fi). Kept loopback by default -- exposing it on the LAN
+# means anyone on the network can drive the CLI, so only opt in on trusted
+# networks (and add token auth before routine remote use).
 HOST = "127.0.0.1"
-PORT = 8765
+BIND_HOST = os.environ.get("TODOCHAT_HOST", HOST).strip() or HOST
+PORT = int(os.environ.get("TODOCHAT_PORT", "8765"))
 APP_DIR = Path(__file__).resolve().parent
 APP_HOME = APP_DIR.parent                 # ToDoChat install dir (default project)
 CONFIG_FILE = APP_HOME / "projects.json"  # persisted project list (gitignored)
@@ -1311,6 +1319,26 @@ def open_app_window(url):
         webbrowser.open(url)
 
 
+def _lan_ip():
+    """Best-effort LAN IPv4 of this machine (for the phone to connect to).
+
+    Uses a dummy UDP connect so no packets are actually sent; falls back to the
+    hostname lookup, then to a placeholder if both fail."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "<このPCのIPアドレス>"
+
+
 def main():
     global _SERVER
     url = f"http://{HOST}:{PORT}/"
@@ -1318,7 +1346,7 @@ def main():
     # (Windows SO_REUSEADDR would otherwise let two servers share port 8765).
     ThreadingHTTPServer.allow_reuse_address = False
     try:
-        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     except OSError:
         print(f"ポート {PORT} は使用中です。ToDoChat は既に起動している可能性があります。")
         print(f"ウィンドウが見当たらない場合は {url} を開いてください。")
@@ -1328,6 +1356,10 @@ def main():
     print(f"ToDoChat running at {url}")
     print(f"  CLI     : {CLI}")
     print(f"  current : {CONFIG['current']}")
+    if BIND_HOST not in ("127.0.0.1", "localhost"):
+        lan_ip = _lan_ip()
+        print(f"  LAN     : 同一ネットワークのスマホ等からは http://{lan_ip}:{PORT}/ で接続できます")
+        print("  ⚠ 認証未実装のため、信頼できるネットワーク（自宅Wi-Fi/VPN）でのみ公開してください。")
     print("Press Ctrl+C to stop.")
     threading.Timer(0.8, lambda: open_app_window(url)).start()
     try:
