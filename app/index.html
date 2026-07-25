@@ -64,9 +64,19 @@
   .pilltoggle.on { color: #7ee0a0; border-color: #2f7a4a; background: #14251b; }
   .pilltoggle.on .sw { color: #08111f; background: #7ee0a0; border-color: #7ee0a0; }
   .denials {
-    align-self: flex-start; max-width: 90%; font-size: 12px; color: #ffb4bb;
-    background: #3a1f24; border: 1px solid #5a2a30; border-radius: 8px; padding: 6px 10px;
+    align-self: flex-start; max-width: 92%; font-size: 12px; color: #ffb4bb;
+    background: #3a1f24; border: 1px solid #5a2a30; border-radius: 8px; padding: 8px 11px;
   }
+  .denials-head { font-weight: 600; margin-bottom: 6px; }
+  .denial-item { padding: 6px 0; border-top: 1px solid #5a2a30; }
+  .denial-item:first-of-type { border-top: none; }
+  .denial-tool { font-weight: 600; color: #ffd7db; }
+  .denial-target {
+    margin: 4px 0 2px; padding: 5px 8px; background: var(--code); border: 1px solid #5a2a30;
+    border-radius: 5px; font-family: Consolas, "Courier New", monospace; font-size: 12px;
+    color: #e6e8ec; white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow-y: auto;
+  }
+  .denial-reason { color: #ffb4bb; line-height: 1.5; }
 
   /* per-command approval card (confirm mode) */
   .perm-card {
@@ -529,13 +539,45 @@ function bubble(text, cls){
   if (cls === 'ai') el.innerHTML = renderMarkdown(text); else el.textContent = text;
   log.appendChild(el); log.scrollTop = log.scrollHeight; return el;
 }
+// Detailed end-of-turn block notice: for each denied tool call, show WHICH tool,
+// WHAT it tried to do (the command / file path), and WHY it was blocked. Handles
+// both our own detailed records ({tool, target, reason}) and the CLI's bare
+// permission_denials ({tool_name, tool_input}) as a fallback.
 function showDenials(denials){
   if (!denials || !denials.length) return;
-  const el = document.createElement('div');
-  el.className = 'denials';
-  el.textContent = '⚠ 安全フィルタにより一部の操作がブロックされました（' + denials.length + '件）: ' +
-    denials.map(d => (d && (d.tool_name || d.reason)) || JSON.stringify(d)).join(' / ');
-  log.appendChild(el); log.scrollTop = log.scrollHeight;
+  const box = document.createElement('div');
+  box.className = 'denials';
+  const head = document.createElement('div');
+  head.className = 'denials-head';
+  head.textContent = `⚠ ${denials.length}件の操作がブロックされました`;
+  box.appendChild(head);
+  denials.forEach(d => {
+    d = d || {};
+    const ti = d.tool_input || {};
+    const tool = d.tool || d.tool_name || '(不明なツール)';
+    const target = d.target || ti.command || ti.file_path || ti.notebook_path || ti.path || ti.url || '';
+    const reason = d.reason || d.message || d.permissionDecisionReason || '';
+    const item = document.createElement('div');
+    item.className = 'denial-item';
+    const t = document.createElement('div');
+    t.className = 'denial-tool';
+    t.textContent = '⛔ ' + tool;
+    item.appendChild(t);
+    if (target){
+      const tg = document.createElement('pre');
+      tg.className = 'denial-target';
+      tg.textContent = target;   // textContent = XSS-safe
+      item.appendChild(tg);
+    }
+    if (reason){
+      const r = document.createElement('div');
+      r.className = 'denial-reason';
+      r.textContent = '理由: ' + reason;
+      item.appendChild(r);
+    }
+    box.appendChild(item);
+  });
+  log.appendChild(box); log.scrollTop = log.scrollHeight;
 }
 function typingBubble(){
   const el = document.createElement('div'); el.className = 'msg ai';

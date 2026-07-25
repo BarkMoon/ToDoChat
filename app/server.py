@@ -29,7 +29,7 @@ from safe_shell import is_safe_command   # read-only-command allowlist (auto-app
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.7.2"
+APP_VERSION = "0.7.3"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -91,17 +91,28 @@ TOOLS_BY_MODE = {"advisory": ADVISORY_TOOLS, "edit": EDIT_TOOLS, "confirm": CONF
 HOOK_MODES = ("edit", "confirm")   # modes that register the guard hook
 GUARD_HOOK = APP_DIR / "edit_guard.py"
 STREAM_INACTIVITY_TIMEOUT = 300    # kill claude after this many seconds of no output (paused while awaiting approval)
-PERM_WAIT_TIMEOUT = 300            # how long the server waits for the user's allow/deny before denying
+# Note: there is deliberately NO timeout on waiting for the user's allow/deny in
+# confirm mode -- request_permission waits until the user answers (or the run's
+# process dies). The inactivity watchdog above is paused while a request is pending.
 
 
 def guard_settings_arg():
     """A --settings JSON string registering the edit-mode PreToolUse guard hook.
-    Passed inline (the CLI accepts a JSON string, not just a file path)."""
+    Passed inline (the CLI accepts a JSON string, not just a file path).
+
+    A large explicit `timeout` (seconds) is essential: in confirm mode the hook
+    blocks while it waits for the user's allow/deny, and the user may be away from
+    the machine. Without this, the CLI's own default PreToolUse hook timeout kicks
+    in and abandons our still-waiting hook, letting the turn finish before the user
+    ever answers -- which defeats the server-side no-deadline wait. Match that
+    server-side backstop here (24h == "wait until the user answers")."""
     py = sys.executable.replace("\\", "/")
     guard = str(GUARD_HOOK).replace("\\", "/")
     command = '"%s" "%s"' % (py, guard)
     return json.dumps({"hooks": {"PreToolUse": [
-        {"matcher": "*", "hooks": [{"type": "command", "command": command}]},
+        {"matcher": "*", "hooks": [
+            {"type": "command", "command": command, "timeout": 86400},
+        ]},
     ]}})
 
 # Models selectable per-message from the UI. Keys are what the client sends;
@@ -617,12 +628,27 @@ def request_permission(run_id, tool, tool_input):
         "id": perm_id, "tool": tool, "command": command, "input": tool_input,
         "desc": desc,
     }))
-    got = ev.wait(PERM_WAIT_TIMEOUT)
+    # Wait for the user's decision with NO hard deadline. Confirm mode exists so a
+    # human can take their time (they may be away from the machine), so we never
+    # auto-deny on a timer. We only stop waiting if the run is torn down or its CLI
+    # process has exited -- e.g. the tab was closed mid-stream, which kills the
+    # process (and this hook's child process with it) -- so this thread can't leak.
+    proc = run.get("proc")
+    answered = False
+    while True:
+        if ev.wait(1.0):
+            answered = True
+            break
+        if proc is not None and proc.poll() is not None:
+            break            # CLI process is gone; nobody can answer anymore
+        with RUNS_LOCK:
+            if RUNS.get(run_id) is not run:
+                break        # this run was cleaned up
     run["perm_pending"] = False
     run["last"] = time.time()
     with PENDING_LOCK:
         rec = PENDING_PERMS.pop(perm_id, None)
-    decision = (rec or {}).get("decision") if got else None
+    decision = (rec or {}).get("decision") if answered else None
     decision = decision if decision in ("allow", "deny") else "deny"
     # A committed change is now recorded; wipe the per-project "which models did
     # the work" memo so the next batch of changes starts a fresh contributor list
@@ -630,6 +656,25 @@ def request_permission(run_id, tool, tool_input):
     if decision == "allow" and tool == "Bash" and _is_git_commit(command):
         clear_contributors(CONFIG["current"])
     return decision
+
+
+def record_denial(run_id, tool, tool_input, reason):
+    """Called by the guard hook (on its HTTP thread) whenever it denies a tool
+    call. Stores a detailed record on the active run so the turn's final event can
+    tell the user exactly WHAT was blocked (tool + command/path) and WHY, and logs
+    it durably to the console / server_error.log for later inspection."""
+    ti = tool_input if isinstance(tool_input, dict) else {}
+    target = (ti.get("command") or ti.get("file_path") or ti.get("notebook_path")
+              or ti.get("path") or ti.get("url") or "")
+    rec = {"tool": tool or "(不明)", "target": target,
+           "reason": reason or "", "ts": time.time()}
+    with RUNS_LOCK:
+        run = RUNS.get(run_id)
+    if run is not None:
+        run["denials"].append(rec)
+    where = f" [{target}]" if target else ""
+    log_error(f"guard denied: {rec['tool']}{where} -> {rec['reason']}")
+    return {"ok": True}
 
 
 def resolve_permission(perm_id, decision):
@@ -972,6 +1017,7 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib
             TODOCHAT_MODE=mode,
             TODOCHAT_RUN_ID=run_id,
             TODOCHAT_PERM_URL=f"http://{HOST}:{PORT}/api/hook/permission",
+            TODOCHAT_DENY_URL=f"http://{HOST}:{PORT}/api/hook/denial",
         )
     sid = SESSIONS.get(norm(proj)) if resume else None
     if sid:
@@ -990,7 +1036,8 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib
         return
 
     q = queue.Queue()
-    run = {"queue": q, "last": time.time(), "perm_pending": False, "timed_out": False, "proc": proc}
+    run = {"queue": q, "last": time.time(), "perm_pending": False, "timed_out": False,
+           "proc": proc, "denials": []}   # denials: detailed guard-hook block records
     with RUNS_LOCK:
         RUNS[run_id] = run
 
@@ -1075,8 +1122,14 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib
     if did_edit:
         add_contributor(proj, model_key)   # credit this model for the file changes
     reply, had_memory = apply_memory_block(proj, result_data.get("result", ""))
+    usage = extract_usage(result_data)
+    # Prefer our own detailed denial records (tool + command/path + reason, captured
+    # by the guard hook) over the CLI's bare permission_denials, so the UI can show
+    # exactly what was blocked and why. Fall back to the CLI list if we captured none.
+    if run["denials"]:
+        usage["permission_denials"] = run["denials"]
     yield {"type": "final", "ok": True, "reply": reply,
-           "usage": extract_usage(result_data), "memory_saved": had_memory}
+           "usage": usage, "memory_saved": had_memory}
 
 
 def read_tasks(d):
@@ -1300,6 +1353,12 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             decision = request_permission(body.get("run_id"), body.get("tool"), body.get("tool_input") or {})
             self._send_json({"decision": decision})
+        elif self.path == "/api/hook/denial":
+            # Called by the guard hook when it denies a tool call, so the turn can
+            # report exactly what was blocked and why (detailed block log).
+            body = self._read_body()
+            self._send_json(record_denial(body.get("run_id"), body.get("tool"),
+                                          body.get("tool_input") or {}, body.get("reason")))
         elif self.path == "/api/permission-response":
             # Called by the browser when the user clicks 許可 / 拒否.
             body = self._read_body()

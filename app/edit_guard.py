@@ -33,11 +33,47 @@ import urllib.request
 READ_ONLY = {"Read", "Glob", "Grep", "LS", "NotebookRead"}
 FILE_WRITE = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 PATH_KEYS = ("file_path", "notebook_path", "path")
-ASK_TIMEOUT = 330   # a bit longer than the server's own wait, then fail closed
+# The server waits for the user's decision with no deadline (confirm mode is meant
+# to let a human take their time). Match that here with a very long backstop rather
+# than a short timeout, so a slow-to-answer user is never auto-denied. If the user
+# closes the window the CLI process -- and this hook child with it -- is killed, so
+# this can't hang forever regardless.
+ASK_TIMEOUT = 86400   # 24h backstop; effectively "wait until the user answers"
+
+
+# Set in main() once the payload is parsed, so decide() can attach the exact tool
+# and inputs to any denial it reports back to the server (for the detailed log).
+_CTX = {"tool": "", "tool_input": {}, "run_id": None}
+
+
+def report_denial(reason):
+    """Best-effort: tell the server WHAT was blocked and WHY, so it can show a
+    detailed, actionable denial notice (which tool, which command/path, the
+    reason) instead of a bare tool name -- and log it durably. Never blocks the
+    decision: any failure here is swallowed."""
+    url = os.environ.get("TODOCHAT_DENY_URL")
+    run_id = _CTX.get("run_id") or os.environ.get("TODOCHAT_RUN_ID")
+    if not url or not run_id:
+        return
+    try:
+        body = json.dumps({
+            "run_id": run_id,
+            "tool": _CTX.get("tool") or "",
+            "tool_input": _CTX.get("tool_input") or {},
+            "reason": reason,
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).close()
+    except Exception:
+        pass
 
 
 def decide(decision, reason):
-    """Emit the hook decision as UTF-8 JSON and exit (0 = handled)."""
+    """Emit the hook decision as UTF-8 JSON and exit (0 = handled). Denials are
+    also reported to the server for the detailed block log."""
+    if decision == "deny":
+        report_denial(reason)
     payload = json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,          # "allow" | "deny"
@@ -91,6 +127,9 @@ def main():
         decide("deny", "フック入力の解析に失敗しました。")
     tool = data.get("tool_name", "")
     ti = data.get("tool_input") or {}
+    _CTX["tool"] = tool
+    _CTX["tool_input"] = ti
+    _CTX["run_id"] = os.environ.get("TODOCHAT_RUN_ID")
     mode = os.environ.get("TODOCHAT_MODE", "edit")
     root = os.environ.get("TODOCHAT_PROJECT_ROOT") or data.get("cwd") or os.getcwd()
     root_n = norm(root)
