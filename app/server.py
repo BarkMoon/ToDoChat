@@ -29,7 +29,7 @@ from safe_shell import is_safe_command   # read-only-command allowlist (auto-app
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.7.9"
+APP_VERSION = "0.7.10"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -613,6 +613,34 @@ def finalize_memory_if_enabled():
     except Exception:
         return False
 
+
+def reset_conversation_on_shutdown():
+    """On a CLEAN shutdown (終了 button / window close) with full-log restore OFF,
+    drop this project's live conversation so the next launch doesn't replay the
+    whole chat (which --resume would do every turn -> heavy tokens). Must run
+    AFTER finalize_memory_if_enabled() so an enabled 終了時記憶 snapshot can still
+    resume the live session first.
+
+    - full-log restore ON  -> keep everything (the toggle opts into resuming it).
+    - 終了時記憶 ON          -> a fresh summary was just saved; keep the memory note
+                               but drop the full log (transcript + session_id) so
+                               next launch resumes from that compact note.
+    - 終了時記憶 OFF         -> no snapshot was taken; wipe the stale memory note too
+                               (backed up to TRASH as usual, via clear_history) so
+                               next launch starts genuinely cold.
+
+    Only runs on a graceful exit: an abnormal termination (crash / kill / power
+    loss) never reaches here, deliberately preserving the pre-crash state so the
+    next launch can restore and resume it."""
+    if CONFIG.get("full_log"):
+        return
+    proj = CONFIG["current"]
+    if CONFIG.get("auto_remember"):
+        clear_transcript(proj)   # drop the visible cross-device mirror
+        drop_session(proj)       # and the session_id -> no full-log resume
+    else:
+        clear_history(proj)      # session + transcript + memory note (backed up to TRASH)
+
 # --- per-command permission plumbing (confirm mode) -------------------------
 # RUNS: active streaming turns, keyed by a run_id passed to the guard hook via
 # env. Each holds a queue the streaming generator drains -- the hook endpoint
@@ -760,6 +788,7 @@ def _shutdown_check():
     # Real window close: optionally snapshot memory before the process exits.
     # (The page is already gone, so this MUST happen server-side.)
     finalize_memory_if_enabled()
+    reset_conversation_on_shutdown()   # full-log OFF: don't resume the chat next launch
     stop_server()
 
 
@@ -1587,6 +1616,7 @@ class Handler(BaseHTTPRequestHandler):
             # while the CLI runs) before stopping. The client awaits this reply,
             # so it can show "記憶を保存して終了中…" during the wait.
             remembered = finalize_memory_if_enabled()
+            reset_conversation_on_shutdown()   # full-log OFF: don't resume the chat next launch
             self._send_json({"ok": True, "remembered": remembered})
             stop_server()
         else:
