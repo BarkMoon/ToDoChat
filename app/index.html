@@ -272,7 +272,7 @@
       </select>
     </div>
     <div class="row">
-      <textarea id="input" placeholder="返信を入力（Enterで改行 / Ctrl+Enter送信 / /remember で記憶を保存 / /clear で消去）" disabled></textarea>
+      <textarea id="input" placeholder="返信を入力（Enterで改行 / Ctrl+Enter送信 / コマンド: /startup /refresh /new /save /remember /clear）" disabled></textarea>
       <button class="send" id="send" disabled>送信</button>
     </div>
   </footer>
@@ -818,16 +818,43 @@ async function streamedTurn(path, payload, onFail){
   }
   return final;
 }
-async function init(){
+// Show the launch greeting (現在の状況 / 次のタスク / 確認). This asks the
+// server for a fresh startup message; server-side it starts a new CLI session
+// for this folder, so it's the "改めて起動し直す" action, not a lightweight
+// re-summary. Reused by the /startup and /new commands.
+async function showStartup(){
   setBusy(true);
   await streamedTurn('/api/init', { model: modelSel.value, mode: currentMode() },
     (msg) => bubble('起動時の応答取得に失敗しました:\n' + msg, 'err'));
   setBusy(false);
 }
+// App-launch / (re)connect bootstrap. If this folder already has a recorded
+// conversation -- an in-progress chat on the PC that a phone is now joining, or
+// simply an app restart -- restore those bubbles and DO NOT regenerate the
+// startup greeting (which would also reset the server-side session). Only a
+// folder with no history yet gets an automatic greeting. Use /startup to show
+// it again by hand, or /new to wipe history and start fresh.
+async function init(){
+  setBusy(true);
+  let restored = false;
+  try {
+    const r = await api('/api/transcript/get', {});
+    const turns = (r && r.turns) || [];
+    if (turns.length){
+      log.innerHTML = ''; resetContextBar();
+      turns.forEach(t => bubble(t.text, t.role === 'user' ? 'user' : 'ai'));
+      bubble('前回までの会話を復元しました。この続きから入力できます。', 'sys');
+      bubble('最新の状況サマリーを表示するには /startup、履歴を消して新しく始めるには /new を送信してください。', 'sys');
+      restored = true;
+    }
+  } catch (_) { /* 履歴の取得に失敗したら通常どおり挨拶を出す */ }
+  setBusy(false);
+  if (!restored) await showStartup();
+}
 // /clear (like the Claude app): forget this project's chat continuity and its
 // memory note, then wipe the visible log. A backup of the note is kept server-
 // side in .todochat/trash (never re-read, so it costs no tokens).
-async function clearHistory(){
+async function clearHistory(showHint = true){
   setBusy(true);
   try {
     const r = await api('/api/clear', {});
@@ -836,9 +863,50 @@ async function clearHistory(){
       ? 'チャット履歴と記憶ログを削除しました。（バックアップは .todochat/trash に保持）'
       : 'チャット履歴を削除しました。（記憶ログはありませんでした）';
     bubble(note, 'sys');
-    bubble('新しい会話を始められます。挨拶を表示するにはウィンドウを再読み込みしてください。', 'sys');
+    // /new は直後に挨拶を出すのでヒントは省く（showHint=false）。
+    if (showHint) bubble('新しい会話を始められます。起動時メッセージを表示するには /startup を送信してください。', 'sys');
   } catch (e){ bubble('削除に失敗しました: ' + e, 'err'); }
   setBusy(false);
+}
+// /new: /clear（履歴・記憶ログ・セッションの消去）に続けて起動時メッセージを
+// 表示し、まっさらな状態から会話を始め直す。
+async function newConversation(){
+  await clearHistory(false);
+  await showStartup();
+}
+// /save: いまの状態を終了時記憶（記憶ログ）へスナップショット保存してから、
+// フルログ（transcript＋セッション）だけを削除する。記憶ノートは残るので、
+// 次回起動は重い会話ログを replay せず、この要約から再開できる（トークン節約）。
+async function saveAndClearLog(){
+  setBusy(true);
+  bubble('/save', 'user');
+  const final = await streamedTurn('/api/remember', { model: modelSel.value },
+    (msg) => bubble('記憶の保存に失敗しました:\n' + msg, 'err'));
+  const ok = !!(final && final.ok);
+  const savedMemory = (ok && final.remembered && final.memory) ? final.memory : '';
+  // 記憶を保存したうえでフルログだけ削除（記憶ノートは残す）。
+  try { await api('/api/clear-log', {}); } catch (_) {}
+  log.innerHTML = ''; resetContextBar();
+  if (ok){
+    bubble(final.remembered
+      ? '終了時記憶を保存し、フルログを削除しました。（記憶ログは保持）'
+      : '記憶すべき進行中の状態は見つかりませんでしたが、フルログを削除しました。', 'sys');
+    if (savedMemory.trim()){
+      const el = document.createElement('div');
+      el.className = 'msg ai';
+      el.innerHTML = '<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">保存した記憶ログ</div>'
+                   + renderMarkdown(savedMemory);
+      log.appendChild(el); log.scrollTop = log.scrollHeight;
+    }
+  }
+  setBusy(false);
+  return ok;
+}
+// /refresh: /save（要約を記憶へ保存＋フルログ削除）に続けて /startup（新しい
+// 挨拶）を実行。やり取りを記憶ログへ圧縮したうえで、新しいチャットを始め直す。
+async function refreshConversation(){
+  await saveAndClearLog();
+  await showStartup();
 }
 // /remember: force a manual snapshot of the current state into the memory note
 // right now (normally the AI decides on its own whether to save one). The reply
@@ -962,6 +1030,10 @@ async function send(){
   const text = input.value.trim();
   if (!text || busy) return;
   if (text === '/clear'){ input.value = ''; input.style.height = 'auto'; await clearHistory(); return; }
+  if (text === '/new'){ input.value = ''; input.style.height = 'auto'; await newConversation(); return; }
+  if (text === '/startup'){ input.value = ''; input.style.height = 'auto'; await showStartup(); return; }
+  if (text === '/save'){ input.value = ''; input.style.height = 'auto'; await saveAndClearLog(); return; }
+  if (text === '/refresh'){ input.value = ''; input.style.height = 'auto'; await refreshConversation(); return; }
   if (text === '/remember'){ input.value = ''; input.style.height = 'auto'; await rememberSnapshot(); return; }
   const model = modelSel.value;   // captured at send time, per message
   const mode = currentMode();
@@ -979,7 +1051,7 @@ async function send(){
 let enterToSend = false;
 function updateInputHint(){
   const keyHint = enterToSend ? 'Enter送信 / Shift+Enter改行' : 'Enterで改行 / Ctrl+Enter送信';
-  input.placeholder = `返信を入力（${keyHint} / /remember で記憶を保存 / /clear で消去）`;
+  input.placeholder = `返信を入力（${keyHint} / コマンド: /startup /refresh /new /save /remember /clear）`;
 }
 function renderEnterMode(){
   if (enterModeSel) enterModeSel.value = enterToSend ? 'send' : 'newline';

@@ -29,7 +29,7 @@ from safe_shell import is_safe_command   # read-only-command allowlist (auto-app
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.7.5"
+APP_VERSION = "0.7.6"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -335,6 +335,17 @@ def clear_history(proj):
     except OSError:
         pass
     return {"ok": True, "cleared_memory": had}
+
+
+def clear_log(proj):
+    """/save & /refresh: drop the live session pointer and the cross-device
+    transcript (the "full log"), but KEEP the memory note. Used right after a
+    forced snapshot so the heavy conversation log is shed while the compact
+    hand-off summary survives -- the next start then resumes from that note
+    instead of replaying everything."""
+    drop_session(proj)       # no stale session_id -> next start is fresh
+    clear_transcript(proj)   # the cross-device chat mirror goes too
+    return {"ok": True}
 
 
 def get_memory(proj):
@@ -1531,6 +1542,10 @@ class Handler(BaseHTTPRequestHandler):
             # /clear typed in chat: drop the live session + delete the memory
             # note for the current project (a backup is kept in TRASH first).
             self._send_json(clear_history(CONFIG["current"]))
+        elif self.path == "/api/clear-log":
+            # /save & /refresh: drop the full log (transcript + session) but keep
+            # the memory note (which the caller has just refreshed via /remember).
+            self._send_json(clear_log(CONFIG["current"]))
         elif self.path == "/api/projects/add":
             self._send_json(add_project(self._read_body().get("path")))
         elif self.path == "/api/projects/switch":
