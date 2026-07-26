@@ -341,13 +341,21 @@
         <div class="set-row">
           <div class="set-label">
             <div class="set-title">接続モード（待受アドレス）</div>
-            <div class="set-note">LANモードは同じWi-Fiのスマホ等からも接続できます（認証は未実装なので信頼できるネットワークのみ）。切替時にファイアウォールの受信許可を自動で設定/解除します（管理者確認が出ます）。待受アドレスの変更は<b>次回起動時</b>に反映されます。</div>
+            <div class="set-note">LANモードは同じWi-Fiのスマホ等からも接続できます（下の接続トークンが必要）。切替時にファイアウォールの受信許可を自動で設定/解除します（管理者確認が出ます）。待受アドレスの変更は<b>次回起動時</b>に反映されます。</div>
             <div class="set-note" id="lanStatus"></div>
           </div>
           <select id="lanModeSel" title="サーバーが待ち受けるアドレスを選びます（次回起動時に反映）">
             <option value="lan">LANモード（スマホ等から接続可・0.0.0.0）</option>
             <option value="local">ローカル限定（このPCのみ・127.0.0.1）</option>
           </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <div class="set-title">接続トークン（スマホ等からの認証）</div>
+            <div class="set-note">スマホからは初回のみ下記URLを開くと認証されます（以降はこの端末では不要）。PC本体（loopback）はトークン不要です。漏洩時は「再生成」で全端末の認証を無効化できます。</div>
+            <div class="set-note" id="authInfo"></div>
+          </div>
+          <button class="pilltoggle" id="authRegenBtn" title="接続トークンを再生成します（既存端末は再認証が必要になります）。">🔑 再生成</button>
         </div>
         <div class="set-row">
           <div class="set-label">
@@ -706,6 +714,9 @@ async function loadProjects(){
     lanFirewall = data.firewall_rule;      // true/false/null: inbound rule present?
     lanFirewallMsg = '';
     renderLanMode();
+    authToken = data.auth_token || '';     // token for phone/VPN auth
+    authUrl = data.lan_url || '';          // one-tap login URL (empty if loopback)
+    renderAuth();
   } catch (_) {}
 }
 async function switchTo(path){
@@ -1142,6 +1153,34 @@ lanModeSel.addEventListener('change', async () => {
     }
   } catch(_){}
   renderLanMode();
+});
+
+// ---- 接続トークン (settings modal) ----
+// Non-loopback clients (phone/VPN) must present this token; PC loopback is exempt.
+// We show the token + a one-tap ?token= login URL, and offer regeneration.
+const authInfo = document.getElementById('authInfo');
+const authRegenBtn = document.getElementById('authRegenBtn');
+let authToken = '';   // current server token
+let authUrl = '';     // LAN login URL (empty while server is loopback-only)
+function renderAuth(){
+  let s = 'トークン: ' + (authToken || '(未取得)');
+  if (authUrl){
+    s += '\nスマホ用URL: ' + authUrl;
+  } else {
+    s += '\n（現在ローカル限定のため外部からの接続はありません。LANモードにするとスマホ用URLが表示されます）';
+  }
+  authInfo.textContent = s;
+  authInfo.style.whiteSpace = 'pre-wrap';
+  authInfo.style.wordBreak = 'break-all';
+}
+authRegenBtn.addEventListener('click', async () => {
+  if (!confirm('接続トークンを再生成しますか？\n既存のスマホ等は次回接続時に新しいトークンでの再認証が必要になります。')) return;
+  authRegenBtn.disabled = true;
+  try {
+    const r = await api('/api/auth/regenerate', {});
+    if (r.ok){ authToken = r.auth_token || ''; authUrl = r.lan_url || ''; renderAuth(); }
+  } catch(_){}
+  authRegenBtn.disabled = false;
 });
 
 document.getElementById('settingsBtn').addEventListener('click', openSettings);

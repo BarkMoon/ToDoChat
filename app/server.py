@@ -21,15 +21,18 @@ import time
 import traceback
 import uuid
 import webbrowser
+import secrets
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 from safe_shell import is_safe_command   # read-only-command allowlist (auto-approve)
 
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.1"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -164,6 +167,52 @@ def load_config():
 
 
 CONFIG = load_config()
+
+
+# --- token authentication ---------------------------------------------------
+# The server can be exposed on the LAN (and, later, over a Tailscale VPN) so a
+# phone can drive the CLI -- which in 実行モード can run arbitrary shell commands.
+# Reaching the port must therefore require a secret. The rule is deliberately
+# simple: connections FROM loopback (127.0.0.1) are trusted unconditionally (the
+# PC's own window, and the guard-hook callbacks which always use HOST=127.0.0.1),
+# while any non-loopback client must present the token. A phone authenticates
+# once via a ?token=... URL (shown in the settings window); the server then sets
+# an HttpOnly cookie so the token isn't resent on every request. The cookie value
+# IS the token, so validation is a constant-time compare against AUTH_TOKEN and a
+# regenerate simply invalidates every existing cookie.
+AUTH_COOKIE = "todochat_auth"
+
+
+def load_or_create_token():
+    """Return the persisted auth token, generating (and saving) one on first run.
+    Stored in projects.json (already gitignored) as 'auth_token'."""
+    tok = (CONFIG.get("auth_token") or "").strip()
+    if not tok:
+        tok = secrets.token_urlsafe(24)
+        CONFIG["auth_token"] = tok
+        save_config(CONFIG)
+    return tok
+
+
+AUTH_TOKEN = load_or_create_token()
+
+
+def regenerate_token():
+    """Mint a fresh token, invalidating every previously issued cookie/URL. Used
+    by the settings-window 'トークン再生成' button after a suspected leak."""
+    global AUTH_TOKEN
+    AUTH_TOKEN = secrets.token_urlsafe(24)
+    CONFIG["auth_token"] = AUTH_TOKEN
+    save_config(CONFIG)
+    return {"ok": True, "auth_token": AUTH_TOKEN, "lan_url": lan_auth_url()}
+
+
+def lan_auth_url():
+    """The one-tap URL a phone uses to log in: LAN address + ?token=. Empty while
+    the server is loopback-only (no remote client to onboard)."""
+    if BIND_HOST in ("127.0.0.1", "localhost"):
+        return ""
+    return f"http://{_lan_ip()}:{PORT}/?token={AUTH_TOKEN}"
 
 
 def lan_mode_enabled():
@@ -844,6 +893,9 @@ def list_projects():
             "lan_active": BIND_HOST not in ("127.0.0.1", "localhost"),
             # Firewall inbound-rule presence (True/False/None) for the status line.
             "firewall_rule": _firewall_rule_exists(),
+            # Token + one-tap login URL for onboarding a phone (shown in settings).
+            "auth_token": AUTH_TOKEN,
+            "lan_url": lan_auth_url(),
             "version": version_string()}
 
 
@@ -1463,6 +1515,88 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError):
             return {}
 
+    # --- token auth (see the "token authentication" section up top) ---------
+    def _client_is_loopback(self):
+        """True when the request comes from this machine (the PC's own window and
+        the guard-hook callbacks). IPv4-mapped IPv6 (::ffff:127.0.0.1) included."""
+        ip = self.client_address[0]
+        return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def _cookie_token(self):
+        raw = self.headers.get("Cookie", "")
+        if not raw:
+            return None
+        try:
+            m = SimpleCookie(raw).get(AUTH_COOKIE)
+        except Exception:
+            return None
+        return m.value if m else None
+
+    def _authenticate(self):
+        """Gate every request. Returns True if the handler may proceed. If not,
+        this method has already written the full response (redirect / login page /
+        401), so the caller must simply return.
+
+        Loopback is always allowed. A non-loopback client is allowed if it carries
+        a valid cookie; if it arrives with a valid ?token=... it gets the cookie
+        set and is redirected to the clean URL; otherwise it gets the login page
+        (GET) or a 401 (API POST)."""
+        if self._client_is_loopback():
+            return True
+        parsed = urlparse(self.path)
+        tok = (parse_qs(parsed.query).get("token") or [""])[0]
+        if tok and secrets.compare_digest(tok, AUTH_TOKEN):
+            # Valid login link: set the cookie and redirect to strip the token
+            # from the address bar (so it isn't bookmarked / shoulder-surfed).
+            clean = parsed.path or "/"
+            self.send_response(302)
+            self.send_header("Location", clean)
+            self.send_header(
+                "Set-Cookie",
+                f"{AUTH_COOKIE}={AUTH_TOKEN}; HttpOnly; SameSite=Lax; "
+                f"Max-Age=31536000; Path=/")
+            self.end_headers()
+            return False
+        cookie = self._cookie_token()
+        if cookie and secrets.compare_digest(cookie, AUTH_TOKEN):
+            return True
+        if self.command == "GET":
+            self._send_login_page()
+        else:
+            self._send_json({"ok": False, "error": "認証が必要です。"}, code=401)
+        return False
+
+    def _send_login_page(self):
+        """Minimal token-entry page for a non-loopback client without a cookie.
+        The form submits by GET (?token=...), which _authenticate turns into a
+        Set-Cookie + redirect."""
+        html = (
+            "<!doctype html><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>ToDoChat</title>"
+            "<style>body{font-family:sans-serif;background:#1e1e1e;color:#eee;"
+            "display:flex;min-height:100vh;margin:0;align-items:center;"
+            "justify-content:center}form{background:#2a2a2a;padding:28px 24px;"
+            "border-radius:12px;width:min(320px,86vw);box-sizing:border-box}"
+            "h1{font-size:18px;margin:0 0 4px}p{font-size:13px;color:#aaa;"
+            "margin:0 0 16px}input{width:100%;box-sizing:border-box;padding:10px;"
+            "font-size:15px;border:1px solid #555;border-radius:8px;background:#1e1e1e;"
+            "color:#eee;margin-bottom:12px}button{width:100%;padding:10px;font-size:15px;"
+            "border:0;border-radius:8px;background:#4a90d9;color:#fff;cursor:pointer}"
+            "</style>"
+            "<form method='get' action='/'>"
+            "<h1>🔒 ToDoChat</h1>"
+            "<p>接続トークンを入力してください。トークンはPC本体の⚙️設定ウィンドウで確認できます。</p>"
+            "<input name='token' type='password' autofocus placeholder='接続トークン'>"
+            "<button type='submit'>接続</button>"
+            "</form>")
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _stream_ndjson(self, events):
         """Stream a generator of dicts to the client as newline-delimited JSON,
         flushing after each one so the browser sees deltas as they're produced.
@@ -1496,6 +1630,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass  # connection is probably gone too; log still has the trace
 
     def do_GET(self):
+        if not self._authenticate():
+            return
         if self.path == "/api/projects":
             self._send_json(list_projects())
             return
@@ -1517,6 +1653,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        if not self._authenticate():
+            return
         if self.path == "/api/init":
             body = self._read_body()
             proj = CONFIG["current"]
@@ -1595,6 +1733,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/lan-mode":
             # Toggle LANモード (listen on 0.0.0.0 vs loopback); persisted, next launch.
             self._send_json(set_lan_mode(self._read_body().get("enabled")))
+        elif self.path == "/api/auth/regenerate":
+            # Mint a fresh token (invalidates every existing cookie / login URL).
+            self._send_json(regenerate_token())
         elif self.path == "/api/transcript/get":
             # 🔄 sync button: return the current project's cross-device transcript.
             self._send_json(get_transcript(CONFIG["current"]))
@@ -1714,7 +1855,8 @@ def main():
     if BIND_HOST not in ("127.0.0.1", "localhost"):
         lan_ip = _lan_ip()
         print(f"  LAN     : 同一ネットワークのスマホ等からは http://{lan_ip}:{PORT}/ で接続できます")
-        print("  ⚠ 認証未実装のため、信頼できるネットワーク（自宅Wi-Fi/VPN）でのみ公開してください。")
+        print(f"  初回のみ接続トークンが必要です: http://{lan_ip}:{PORT}/?token={AUTH_TOKEN}")
+        print("  （PC本体＝loopbackはトークン不要。トークンは⚙️設定でも確認/再生成できます）")
     print("Press Ctrl+C to stop.")
     threading.Timer(0.8, lambda: open_app_window(url)).start()
     try:
