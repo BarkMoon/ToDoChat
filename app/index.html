@@ -352,9 +352,14 @@
         <div class="set-row">
           <div class="set-label">
             <div class="set-title">接続トークン（スマホ等からの認証）</div>
-            <div class="set-note">スマホからは初回のみ下記URLを開くと認証されます（以降はこの端末では不要）。PC本体（loopback）はトークン不要です。漏洩時は「再生成」で全端末の認証を無効化できます。</div>
+            <div class="set-note">スマホからは初回のみ下記URLを開く／QRを読むと認証されます（以降はこの端末では不要）。PC本体（loopback）はトークン不要です。漏洩時は「再生成」で全端末の認証を無効化できます。</div>
             <div class="set-note" id="authInfo"></div>
-            <div id="authQr" title="スマホのカメラでこのQRを読むと初回認証が済みます。" style="margin-top:8px;"></div>
+            <div class="set-note" style="margin-top:12px;"><b>📶 同一Wi-Fi用（LAN）</b></div>
+            <div class="set-note" id="lanInfo"></div>
+            <div id="authQr" title="同じWi-FiのスマホでこのQRを読むと初回認証が済みます。" style="margin-top:4px;"></div>
+            <div class="set-note" style="margin-top:14px;"><b>🌐 外出先用（Tailscale VPN）</b></div>
+            <div class="set-note" id="tsInfo"></div>
+            <div id="authTsQr" title="外出先のスマホでTailscaleをONにしてこのQRを読むと初回認証が済みます。" style="margin-top:4px;"></div>
           </div>
           <button class="pilltoggle" id="authRegenBtn" title="接続トークンを再生成します（既存端末は再認証が必要になります）。">🔑 再生成</button>
         </div>
@@ -716,7 +721,8 @@ async function loadProjects(){
     lanFirewallMsg = '';
     renderLanMode();
     authToken = data.auth_token || '';     // token for phone/VPN auth
-    authUrl = data.lan_url || '';          // one-tap login URL (empty if loopback)
+    authUrl = data.lan_url || '';          // LAN one-tap login URL (empty if loopback)
+    tsUrl = data.tailscale_url || '';      // Tailscale one-tap URL (empty if unavailable)
     renderAuth();
   } catch (_) {}
 }
@@ -1160,10 +1166,14 @@ lanModeSel.addEventListener('change', async () => {
 // Non-loopback clients (phone/VPN) must present this token; PC loopback is exempt.
 // We show the token + a one-tap ?token= login URL, and offer regeneration.
 const authInfo = document.getElementById('authInfo');
+const lanInfo = document.getElementById('lanInfo');
 const authQr = document.getElementById('authQr');
+const tsInfo = document.getElementById('tsInfo');
+const authTsQr = document.getElementById('authTsQr');
 const authRegenBtn = document.getElementById('authRegenBtn');
 let authToken = '';   // current server token
 let authUrl = '';     // LAN login URL (empty while server is loopback-only)
+let tsUrl = '';       // Tailscale (outside-LAN) login URL (empty if unavailable)
 
 // ---- minimal QR encoder (byte mode, EC level M, versions 1-10) ----
 // Self-contained: no CDN/library so the QR renders offline on the LAN. The
@@ -1354,21 +1364,26 @@ const QR = (function(){
 })();
 
 function renderAuth(){
-  let s = 'トークン: ' + (authToken || '(未取得)');
-  if (authUrl){
-    s += '\nスマホ用URL: ' + authUrl;
-  } else {
-    s += '\n（現在ローカル限定のため外部からの接続はありません。LANモードにするとスマホ用URLが表示されます）';
-  }
-  authInfo.textContent = s;
+  authInfo.textContent = 'トークン: ' + (authToken || '(未取得)');
   authInfo.style.whiteSpace = 'pre-wrap';
   authInfo.style.wordBreak = 'break-all';
-  // QR of the one-tap login URL (only meaningful when a LAN URL exists).
-  authQr.textContent = '';
-  if (authUrl){
-    const svg = QR.render(authUrl);
-    if (svg) authQr.appendChild(svg);
-    else authQr.textContent = '（URLが長すぎてQRを生成できませんでした）';
+  // Same-Wi-Fi (LAN) URL + QR.
+  renderQrBlock(lanInfo, authQr, authUrl,
+    '（現在ローカル限定のためLAN用URLはありません。LANモードにすると表示されます）');
+  // Outside-the-LAN (Tailscale) URL + QR.
+  renderQrBlock(tsInfo, authTsQr, tsUrl,
+    'Tailscale未検出（PC・スマホにTailscaleを入れ同一アカウントでログインすると外出先用URLが表示されます）。');
+}
+// Fill one info line + its QR from a login URL, or show a fallback note when empty.
+function renderQrBlock(infoEl, qrEl, url, emptyMsg){
+  infoEl.textContent = url ? ('スマホ用URL: ' + url) : emptyMsg;
+  infoEl.style.whiteSpace = 'pre-wrap';
+  infoEl.style.wordBreak = 'break-all';
+  qrEl.textContent = '';
+  if (url){
+    const svg = QR.render(url);
+    if (svg) qrEl.appendChild(svg);
+    else qrEl.textContent = '（URLが長すぎてQRを生成できませんでした）';
   }
 }
 authRegenBtn.addEventListener('click', async () => {
@@ -1376,7 +1391,7 @@ authRegenBtn.addEventListener('click', async () => {
   authRegenBtn.disabled = true;
   try {
     const r = await api('/api/auth/regenerate', {});
-    if (r.ok){ authToken = r.auth_token || ''; authUrl = r.lan_url || ''; renderAuth(); }
+    if (r.ok){ authToken = r.auth_token || ''; authUrl = r.lan_url || ''; tsUrl = r.tailscale_url || ''; renderAuth(); }
   } catch(_){}
   authRegenBtn.disabled = false;
 });

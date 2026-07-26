@@ -32,7 +32,7 @@ from safe_shell import is_safe_command   # read-only-command allowlist (auto-app
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.2"
+APP_VERSION = "0.8.3"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -204,7 +204,8 @@ def regenerate_token():
     AUTH_TOKEN = secrets.token_urlsafe(24)
     CONFIG["auth_token"] = AUTH_TOKEN
     save_config(CONFIG)
-    return {"ok": True, "auth_token": AUTH_TOKEN, "lan_url": lan_auth_url()}
+    return {"ok": True, "auth_token": AUTH_TOKEN, "lan_url": lan_auth_url(),
+            "tailscale_url": tailscale_auth_url()}
 
 
 def lan_auth_url():
@@ -213,6 +214,20 @@ def lan_auth_url():
     if BIND_HOST in ("127.0.0.1", "localhost"):
         return ""
     return f"http://{_lan_ip()}:{PORT}/?token={AUTH_TOKEN}"
+
+
+def tailscale_auth_url():
+    """One-tap login URL for a phone connecting from OUTSIDE the LAN over Tailscale:
+    Tailscale IP + ?token=. Empty when the server is loopback-only (Tailscale can't
+    reach it) or Tailscale isn't available (no address to hand out). Since the LAN
+    server already listens on 0.0.0.0, the Tailscale virtual adapter is covered
+    automatically -- only the address the phone should dial differs."""
+    if BIND_HOST in ("127.0.0.1", "localhost"):
+        return ""
+    ip = _tailscale_ip()
+    if not ip:
+        return ""
+    return f"http://{ip}:{PORT}/?token={AUTH_TOKEN}"
 
 
 def lan_mode_enabled():
@@ -896,6 +911,8 @@ def list_projects():
             # Token + one-tap login URL for onboarding a phone (shown in settings).
             "auth_token": AUTH_TOKEN,
             "lan_url": lan_auth_url(),
+            # Outside-the-LAN one-tap URL over Tailscale (empty if unavailable).
+            "tailscale_url": tailscale_auth_url(),
             "version": version_string()}
 
 
@@ -1835,6 +1852,57 @@ def _lan_ip():
             return "<このPCのIPアドレス>"
 
 
+def _is_cgnat(ip):
+    """True if ip is inside Tailscale's 100.64.0.0/10 range (100.64.0.0 -
+    100.127.255.255), the CGNAT block Tailscale assigns to tailnet nodes."""
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        octets = [int(p) for p in parts]
+    except ValueError:
+        return False
+    if any(o < 0 or o > 255 for o in octets):
+        return False
+    return octets[0] == 100 and 64 <= octets[1] <= 127
+
+
+_TS_IP_CACHE = ""
+
+
+def _tailscale_ip():
+    """Best-effort Tailscale IPv4 (100.64.0.0/10) of this machine, so a phone
+    outside the LAN can be handed the right address to dial over Tailscale. Empty
+    when Tailscale isn't installed/up. Asks the `tailscale` CLI first (authoritative),
+    then falls back to scanning this host's own addresses for the CGNAT range.
+    Cached once found -- the tailnet address is stable for the process's lifetime."""
+    global _TS_IP_CACHE
+    if _TS_IP_CACHE:
+        return _TS_IP_CACHE
+    for exe in ("tailscale", r"C:\Program Files\Tailscale\tailscale.exe"):
+        try:
+            r = subprocess.run([exe, "ip", "-4"], capture_output=True,
+                               text=True, timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            continue  # not this path (or hung) -- try the next candidate
+        for line in r.stdout.splitlines():
+            ip = line.strip()
+            if _is_cgnat(ip):
+                _TS_IP_CACHE = ip
+                return ip
+        break  # CLI ran but yielded no tailnet IP; don't retry the same binary
+    try:  # fallback: the OS may list the tailnet address among our own IPs
+        import socket
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if _is_cgnat(ip):
+                _TS_IP_CACHE = ip
+                return ip
+    except OSError:
+        pass
+    return ""
+
+
 def main():
     global _SERVER
     url = f"http://{HOST}:{PORT}/"
@@ -1856,6 +1924,9 @@ def main():
         lan_ip = _lan_ip()
         print(f"  LAN     : 同一ネットワークのスマホ等からは http://{lan_ip}:{PORT}/ で接続できます")
         print(f"  初回のみ接続トークンが必要です: http://{lan_ip}:{PORT}/?token={AUTH_TOKEN}")
+        ts_ip = _tailscale_ip()
+        if ts_ip:
+            print(f"  外出先  : Tailscale経由は http://{ts_ip}:{PORT}/ で接続（初回のみ ?token= 付きURL）")
         print("  （PC本体＝loopbackはトークン不要。トークンは⚙️設定でも確認/再生成できます）")
     print("Press Ctrl+C to stop.")
     threading.Timer(0.8, lambda: open_app_window(url)).start()
