@@ -249,7 +249,7 @@
     </div>
     <button class="pilltoggle" id="autoRemBtn" title="ウィンドウ終了時に、現在の状態を自動で記憶ログへ保存します（次回起動時に引き継がれます）">💾 終了時記憶<span class="sw" id="autoRemState">OFF</span></button>
     <button class="pilltoggle" id="fullLogBtn" title="次回起動時、要約メモではなく前回の会話ログ全体を復元して再開します（深掘り作業向け）。毎ターン全履歴を再送するためトークン消費が大きくなります。">📜 フルログ復元<span class="sw" id="fullLogState">OFF</span></button>
-    <button class="iconbtn" id="settingsBtn" title="設定（改行キー・スタートアップ登録）">⚙️</button>
+    <button class="iconbtn" id="settingsBtn" title="設定（改行キー・接続モード・スタートアップ登録）">⚙️</button>
     <span class="status" id="status">起動中…</span>
     <button class="iconbtn quit" id="quitBtn" title="ToDoChatを終了（サーバーを停止してウィンドウを閉じます）">✕</button>
   </header>
@@ -336,6 +336,17 @@
           <select id="enterModeSel" title="入力欄でEnterを押したときの動作">
             <option value="newline">Enterで改行 / Ctrl+Enterで送信（推奨）</option>
             <option value="send">Enterで送信 / Shift+Enterで改行</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <div class="set-label">
+            <div class="set-title">接続モード（待受アドレス）</div>
+            <div class="set-note">LANモードは同じWi-Fiのスマホ等からも接続できます（認証は未実装なので信頼できるネットワークのみ）。切替時にファイアウォールの受信許可を自動で設定/解除します（管理者確認が出ます）。待受アドレスの変更は<b>次回起動時</b>に反映されます。</div>
+            <div class="set-note" id="lanStatus"></div>
+          </div>
+          <select id="lanModeSel" title="サーバーが待ち受けるアドレスを選びます（次回起動時に反映）">
+            <option value="lan">LANモード（スマホ等から接続可・0.0.0.0）</option>
+            <option value="local">ローカル限定（このPCのみ・127.0.0.1）</option>
           </select>
         </div>
         <div class="set-row">
@@ -689,6 +700,12 @@ async function loadProjects(){
     renderFullLog();
     enterToSend = !!data.enter_to_send;    // restore Enter-key behaviour
     renderEnterMode();
+    lanMode = data.lan_mode !== false;     // restore LANモード choice (default ON)
+    lanEnvOverride = !!data.lan_env_override;
+    lanActive = !!data.lan_active;
+    lanFirewall = data.firewall_rule;      // true/false/null: inbound rule present?
+    lanFirewallMsg = '';
+    renderLanMode();
   } catch (_) {}
 }
 async function switchTo(path){
@@ -995,6 +1012,56 @@ enterModeSel.addEventListener('change', async () => {
   renderEnterMode();
   enterModeSel.disabled = false;
 });
+// ---- LANモード setting (settings modal) ----
+// Chooses the server's listen address: LAN (0.0.0.0, phone can connect) vs
+// local-only (127.0.0.1). Persisted in projects.json (default LAN). The address
+// is bound once at startup, so a change takes effect on the NEXT launch -- the
+// status line tells the user whether a restart is still pending.
+const lanModeSel = document.getElementById('lanModeSel');
+const lanStatus = document.getElementById('lanStatus');
+let lanMode = true;          // saved preference (applies next launch)
+let lanEnvOverride = false;  // TODOCHAT_HOST env pins the address this run
+let lanActive = false;       // whether the server is actually on the LAN right now
+let lanFirewall = null;      // true/false/null: inbound firewall rule present?
+let lanFirewallMsg = '';     // one-off message from the most recent toggle
+function renderLanMode(){
+  lanModeSel.value = lanMode ? 'lan' : 'local';
+  lanModeSel.disabled = lanEnvOverride;
+  let s;
+  if (lanEnvOverride){
+    s = '⚠ 環境変数 TODOCHAT_HOST が設定されているため、この設定は無視されます（現在: '
+      + (lanActive ? 'LAN公開中' : 'ローカル限定') + '）。';
+  } else if (lanMode === lanActive){
+    s = '現在: ' + (lanActive ? 'LAN公開中' : 'ローカル限定') + '（設定と一致）。';
+  } else {
+    s = '現在: ' + (lanActive ? 'LAN公開中' : 'ローカル限定')
+      + ' → 変更は次回起動時に反映されます。';
+  }
+  // Firewall line: current rule presence + any message from the last toggle.
+  if (lanFirewall === true) s += ' ファイアウォール受信許可: 設定済み。';
+  else if (lanFirewall === false) s += ' ファイアウォール受信許可: 未設定。';
+  if (lanFirewallMsg) s += ' ' + lanFirewallMsg;
+  lanStatus.textContent = s;
+}
+lanModeSel.addEventListener('change', async () => {
+  const next = lanModeSel.value === 'lan';
+  lanModeSel.disabled = true;
+  lanFirewallMsg = '';
+  try {
+    const r = await api('/api/lan-mode', { enabled: next });
+    if (r.ok){
+      lanMode = !!r.enabled; lanActive = !!r.active; lanEnvOverride = !!r.env_override;
+      const fw = r.firewall;
+      if (fw){
+        lanFirewallMsg = fw.message || '';
+        // Keep the presence indicator in sync when a change actually succeeded.
+        if (fw.ok && fw.attempted) lanFirewall = next;
+      }
+    }
+  } catch(_){}
+  renderLanMode();
+});
+
 document.getElementById('settingsBtn').addEventListener('click', openSettings);
 document.getElementById('settingsClose').addEventListener('click', closeSettings);
 settingsModal.addEventListener('click', (e) => { if (e.target === settingsModal) closeSettings(); });

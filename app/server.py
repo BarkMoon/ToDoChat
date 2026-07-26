@@ -29,18 +29,20 @@ from safe_shell import is_safe_command   # read-only-command allowlist (auto-app
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.7.3"
+APP_VERSION = "0.7.5"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
 # callback URL (edit_guard / permission hooks connect from a local subprocess),
 # so it must stay a loopback address. BIND_HOST is what the HTTP server actually
-# listens on: set env TODOCHAT_HOST=0.0.0.0 to also accept LAN clients (e.g. a
-# phone on the same Wi-Fi). Kept loopback by default -- exposing it on the LAN
-# means anyone on the network can drive the CLI, so only opt in on trusted
-# networks (and add token auth before routine remote use).
+# listens on. The choice is driven by the in-app "LANモード" setting (persisted in
+# projects.json as "lan_mode", default ON = 0.0.0.0 so a phone on the same Wi-Fi
+# can connect). Exposing it on the LAN means anyone on the network can drive the
+# CLI, so switch to ローカル限定 on untrusted networks (and add token auth before
+# routine remote use). Env TODOCHAT_HOST, if set, overrides the in-app setting.
+# BIND_HOST is resolved after CONFIG is loaded (see resolve_bind_host below).
 HOST = "127.0.0.1"
-BIND_HOST = os.environ.get("TODOCHAT_HOST", HOST).strip() or HOST
+_HOST_ENV = os.environ.get("TODOCHAT_HOST", "").strip()
 PORT = int(os.environ.get("TODOCHAT_PORT", "8765"))
 APP_DIR = Path(__file__).resolve().parent
 APP_HOME = APP_DIR.parent                 # ToDoChat install dir (default project)
@@ -162,6 +164,24 @@ def load_config():
 
 
 CONFIG = load_config()
+
+
+def lan_mode_enabled():
+    """Whether the server should listen on the LAN. Default ON (LANモード) so a
+    phone on the same Wi-Fi can connect out of the box; the user can switch to
+    ローカル限定 in the settings window. Stored in projects.json as "lan_mode"."""
+    return CONFIG.get("lan_mode") is not False
+
+
+def resolve_bind_host():
+    """Address the HTTP server listens on. An explicit TODOCHAT_HOST env var wins
+    (advanced override); otherwise the in-app LANモード setting decides."""
+    if _HOST_ENV:
+        return _HOST_ENV
+    return "0.0.0.0" if lan_mode_enabled() else HOST
+
+
+BIND_HOST = resolve_bind_host()
 
 # --- session-id persistence (for the optional full-log restore mode) --------
 # SESSIONS maps norm(project_path) -> the CLI session_id of that project's live
@@ -775,6 +795,15 @@ def list_projects():
             "auto_remember": bool(CONFIG.get("auto_remember")),
             "full_log": bool(CONFIG.get("full_log")),
             "enter_to_send": bool(CONFIG.get("enter_to_send")),
+            "lan_mode": lan_mode_enabled(),
+            # True when TODOCHAT_HOST env pins the address -> in-app toggle is moot
+            # this run; UI disables the control and explains why.
+            "lan_env_override": bool(_HOST_ENV),
+            # What the server is ACTUALLY listening on right now, so the UI can tell
+            # the user whether a changed setting still needs a restart to take hold.
+            "lan_active": BIND_HOST not in ("127.0.0.1", "localhost"),
+            # Firewall inbound-rule presence (True/False/None) for the status line.
+            "firewall_rule": _firewall_rule_exists(),
             "version": version_string()}
 
 
@@ -795,6 +824,27 @@ def set_full_log(enabled):
     CONFIG["full_log"] = bool(enabled)
     save_config(CONFIG)
     return {"ok": True, "enabled": CONFIG["full_log"]}
+
+
+def set_lan_mode(enabled):
+    """Persist the LANモード toggle into projects.json. Global and default ON
+    (0.0.0.0 = accept LAN clients). Takes effect on the NEXT launch because the
+    listen address is bound once at startup, so the response reports whether a
+    restart is still needed to match the new setting.
+
+    Switching also syncs the Windows firewall inbound rule: LANモード adds the
+    port allow-rule (initial setup), ローカル限定 removes it (cleanup). The config
+    flag is saved first and unconditionally, so a cancelled/failed UAC prompt
+    still records the user's choice -- the firewall result is reported separately
+    for the UI to surface."""
+    enabled = bool(enabled)
+    CONFIG["lan_mode"] = enabled
+    save_config(CONFIG)
+    firewall = _sync_firewall_for_mode(enabled)
+    return {"ok": True, "enabled": enabled,
+            "active": BIND_HOST not in ("127.0.0.1", "localhost"),
+            "env_override": bool(_HOST_ENV),
+            "firewall": firewall}
 
 
 def set_enter_to_send(enabled):
@@ -857,6 +907,103 @@ def _schtasks_elevated(argstr):
         return -1
     except subprocess.TimeoutExpired:
         return -2
+
+
+# --- Windows firewall rule for LAN mode -------------------------------------
+# LANモード (0.0.0.0) is useless if Windows Firewall drops inbound connections,
+# so switching modes also sets up / tears down a single inbound-allow rule for
+# our port. The rule is scoped to profile=private (home Wi-Fi etc.) as the safe
+# default. Creating/deleting a firewall rule needs admin, so we self-elevate for
+# that one click via the same one-shot UAC path used for startup registration.
+FIREWALL_RULE_NAME = "ToDoChat"
+
+
+def _firewall_rule_exists():
+    """True/False if the ToDoChat inbound rule is present, or None if netsh is
+    unavailable / the check failed (non-Windows, etc.). Read-only, so it runs
+    unelevated -- standard users may query firewall rules."""
+    try:
+        # Discard output (don't decode it): netsh prints localized text (cp932 on
+        # Japanese Windows) that can crash text-mode capture, and we only need the
+        # exit code -- 0 when a matching rule exists, 1 ("No rules match...") when
+        # none do, reliable regardless of locale.
+        r = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule",
+             f"name={FIREWALL_RULE_NAME}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+    return r.returncode == 0
+
+
+def _netsh_elevated(argstr):
+    """Run `netsh <argstr>` elevated via a one-shot UAC prompt; return its exit
+    code. Mirrors _schtasks_elevated: the argstr is one verbatim argument line so
+    netsh's own tokens survive Start-Process untouched. Returns _UAC_CANCELLED if
+    the user dismisses the UAC dialog."""
+    ps = (
+        "$ErrorActionPreference='Stop';"
+        "try {"
+        f"  $p = Start-Process -FilePath netsh.exe -ArgumentList '{argstr}'"
+        "   -Verb RunAs -Wait -PassThru -WindowStyle Hidden;"
+        "  exit $p.ExitCode"
+        "} catch {"
+        f"  exit {_UAC_CANCELLED}"
+        "}"
+    )
+    try:
+        # We only care about the exit code; discard output to avoid decoding
+        # localized text (see _firewall_rule_exists).
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        return r.returncode
+    except FileNotFoundError:
+        return -1
+    except subprocess.TimeoutExpired:
+        return -2
+
+
+def _firewall_result(code, ok_msg):
+    """Map a _netsh_elevated exit code to a UI-friendly firewall result dict."""
+    if code == 0:
+        return {"attempted": True, "ok": True, "cancelled": False, "message": ok_msg}
+    if code == _UAC_CANCELLED:
+        return {"attempted": True, "ok": False, "cancelled": True,
+                "message": "管理者確認がキャンセルされたため、ファイアウォール設定は変更していません。"}
+    return {"attempted": True, "ok": False, "cancelled": False,
+            "message": "ファイアウォール設定の変更に失敗しました（管理者権限が必要です）。"}
+
+
+def _sync_firewall_for_mode(lan):
+    """Add (LANモード) or remove (ローカル限定) the inbound firewall rule to match
+    the chosen mode. Only prompts for UAC when a change is actually needed -- if
+    the rule is already in the desired state we do nothing (so re-selecting the
+    same mode won't nag). Returns a result dict for the UI (or None when the
+    firewall can't be managed on this machine)."""
+    exists = _firewall_rule_exists()
+    if exists is None:
+        return {"attempted": False, "ok": False, "cancelled": False,
+                "message": "ファイアウォールを操作できませんでした（netsh 不可）。手動設定が必要な場合があります。"}
+    if lan:
+        if exists:
+            return {"attempted": False, "ok": True, "cancelled": False,
+                    "message": "ファイアウォールの受信許可は設定済みです。"}
+        argstr = (f"advfirewall firewall add rule name={FIREWALL_RULE_NAME} "
+                  f"dir=in action=allow protocol=TCP localport={PORT} profile=private")
+        return _firewall_result(
+            _netsh_elevated(argstr),
+            f"ファイアウォールにポート{PORT}の受信許可（プライベート）を追加しました。")
+    else:
+        if not exists:
+            return {"attempted": False, "ok": True, "cancelled": False,
+                    "message": "ファイアウォールの受信許可ルールはありません（クリーンです）。"}
+        argstr = f"advfirewall firewall delete rule name={FIREWALL_RULE_NAME}"
+        return _firewall_result(
+            _netsh_elevated(argstr),
+            "ファイアウォールの受信許可ルールを削除しました。")
 
 
 def get_startup_status():
@@ -1401,6 +1548,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/enter-mode":
             # Toggle Enter-key behaviour (Enter sends vs. Ctrl+Enter sends); persisted.
             self._send_json(set_enter_to_send(self._read_body().get("enabled")))
+        elif self.path == "/api/lan-mode":
+            # Toggle LANモード (listen on 0.0.0.0 vs loopback); persisted, next launch.
+            self._send_json(set_lan_mode(self._read_body().get("enabled")))
         elif self.path == "/api/transcript/get":
             # 🔄 sync button: return the current project's cross-device transcript.
             self._send_json(get_transcript(CONFIG["current"]))
