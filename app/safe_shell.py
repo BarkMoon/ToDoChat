@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """ToDoChat safe-shell allowlist (single source of truth).
 
-`is_safe_command(command)` returns True only for shell commands that inspect
-state without changing any file, branch, or repository state -- e.g. `git log`,
-`git status`, `head`, `echo`. Confirm mode uses this to AUTO-approve such
+`is_safe_command(command)` (Bash) and `is_safe_powershell(command)` (PowerShell)
+return True only for shell commands that inspect state without changing any file,
+branch, or repository state -- e.g. `git log`, `git status`, `head`, `echo`, or
+`Get-ChildItem`, `Get-Content`. Confirm mode uses this to AUTO-approve such
 commands (the approval card is still shown for visibility, but the user does not
 have to click). Anything this module is not certain about returns False and
 falls back to the normal per-command manual approval -- so a missed command
@@ -216,3 +217,83 @@ def is_safe_command(command):
     if not segments:
         return False
     return all(_segment_safe(s) for s in segments)
+
+
+# --- PowerShell read-only allowlist -----------------------------------------
+# PowerShell is a second shell the wrapped CLI can drive on Windows. The same
+# philosophy as the Bash checker above governs here: prove a command is read-only
+# or return False. The job is actually SIMPLER, because every PowerShell
+# construct that could smuggle arbitrary execution into an otherwise-safe
+# pipeline is rejected outright as a forbidden substring:
+#   {  }        scriptblocks: `... | ForEach-Object { rm x }`, `& { ... }`
+#   $(  )  @(   subexpressions / grouping / method calls / array/hashtable
+#   @{          literals -- e.g. `(Get-Item x).Delete()`, `$(rm x)`
+#   `           the backtick escape / line-continuation character
+#   >  <        redirection that writes a real file
+#   newline     multiple statements
+# What survives is a flat `Cmdlet -args | Cmdlet -args` pipeline, so requiring
+# every segment to begin with an allow-listed read-only cmdlet/alias (and
+# rejecting the stray `&` call operator) is a positive proof of read-only.
+# Cmdlets that write are simply absent from the allowlist (Out-File, Set-Content,
+# Remove-Item, ...), and ForEach-Object is deliberately excluded because its
+# -MemberName form can invoke a method (`Get-Process | ForEach-Object Kill`)
+# without any scriptblock.
+_PS_FORBIDDEN = ("`", "$(", "${", "@(", "@{", ">", "<", "(", ")", "{", "}", "\n", "\r")
+
+# Provably-harmless PowerShell redirections, stripped BEFORE the `>`/`<`
+# rejection (mirrors _SAFE_REDIR_RE for Bash): discard a stream to $null, or
+# merge one stream into another. `[n|*]>$null`, `[n|*]>>$null`, `[n|*]>&[m]`.
+_PS_SAFE_REDIR_RE = re.compile(
+    r"[0-9*]?>>?\s*\$null\b"
+    r"|[0-9*]?>&[0-9]"
+)
+
+# Read-only PowerShell cmdlets and aliases (lowercased -- PowerShell is
+# case-insensitive), loaded from the editable [powershell] section.
+_PS_SAFE_CMDLETS = {c.lower() for c in _ALLOW.get("powershell", ())}
+
+
+def _ps_prog_name(token):
+    """Cmdlet/alias name for matching: strip surrounding quotes, any directory,
+    a trailing .exe, and lowercase it (PowerShell is case-insensitive)."""
+    t = token.strip().strip('"').strip("'")
+    name = os.path.basename(t)
+    if name.lower().endswith(".exe"):
+        name = name[:-4]
+    return name.lower()
+
+
+def _ps_segment_safe(segment):
+    """True if one separator-delimited piece of a PowerShell command is read-only:
+    an allow-listed read-only cmdlet/alias, OR a native command (git, findstr, ...)
+    that the Bash checker already proves read-only -- PowerShell invokes native
+    programs with the same `program arg arg` syntax, so `git status` / `git log`
+    run through PowerShell auto-approve just like they do under Bash."""
+    if _segment_safe(segment):
+        return True
+    try:
+        # posix=False keeps Windows backslash paths intact (PowerShell does not
+        # treat `\` as an escape); we only need the leading cmdlet name anyway.
+        tokens = shlex.split(segment, posix=False)
+    except ValueError:
+        return False                       # unbalanced quotes etc. -> not sure
+    if not tokens:
+        return False
+    return _ps_prog_name(tokens[0]) in _PS_SAFE_CMDLETS
+
+
+def is_safe_powershell(command):
+    """True only when `command` is certain to be a read-only PowerShell pipeline
+    (safe to auto-run). Fails closed on anything it cannot positively prove."""
+    if not command or not isinstance(command, str):
+        return False
+    command = _PS_SAFE_REDIR_RE.sub(" ", command)
+    if any(bad in command for bad in _PS_FORBIDDEN):
+        return False
+    # Reject the call operator / background '&' (a stray single '&', not '&&').
+    if "&" in command.replace("&&", ""):
+        return False
+    segments = [s.strip() for s in _SEPARATORS.split(command) if s.strip()]
+    if not segments:
+        return False
+    return all(_ps_segment_safe(s) for s in segments)

@@ -163,3 +163,98 @@ get-tar-commit-id
 [git-listing.remote]
 -v
 --verbose
+
+
+# [powershell] — 読み取り専用の PowerShell コマンドレット／エイリアス。
+# 「実行（都度確認）」モードで PowerShell ツールを自動許可する対象です
+# （判定は safe_shell.py の is_safe_powershell が行います）。
+# 大文字小文字は区別しません（PowerShell 準拠。内部で小文字化して比較）。
+#
+# 載せてよいのは、単体でファイル・レジストリ・プロセス・サービス等の状態を
+# 変えない“取得/表示/検査”系だけです。書き込み系(Out-File, Set-Content,
+# Add-Content, Export-*, Tee-Object, New-Item, Remove-Item, Set-* ...)や、
+# 他コード/メソッドを実行しうるもの(Invoke-Expression/iex, Invoke-Command,
+# Start-Process, ForEach-Object/% ...)は載せないこと。
+# ※ ForEach-Object は -MemberName でメソッド実行が可能なため除外
+#   （例: `Get-Process | ForEach-Object Kill`）。
+# ※ スクリプトブロック {} ・部分式 $() ・グルーピング () ・呼び出し演算子 & ・
+#   リダイレクト(> <) を含むコマンドは、たとえ中身が安全に見えても自動許可
+#   されません（safe_shell.py 側で弾いています）。
+# ※ Where-Object は比較構文（`Where-Object Name -eq foo`）のみ安全に扱えます。
+#   スクリプトブロック形 `Where-Object { ... }` は {} が禁止されるため自動許可外。
+[powershell]
+get-childitem
+gci
+ls
+dir
+get-content
+gc
+cat
+type
+get-item
+gi
+get-itemproperty
+gp
+get-itempropertyvalue
+get-location
+pwd
+gl
+get-command
+gcm
+get-help
+help
+man
+get-member
+gm
+get-alias
+gal
+get-history
+history
+h
+get-process
+ps
+gps
+get-service
+gsv
+get-date
+get-random
+get-uptime
+get-timezone
+get-culture
+get-host
+get-variable
+gv
+get-module
+gmo
+test-path
+resolve-path
+rvpa
+split-path
+join-path
+convert-path
+cvpa
+select-object
+select
+where-object
+where
+sort-object
+sort
+measure-object
+measure
+group-object
+group
+compare-object
+compare
+select-string
+sls
+format-list
+fl
+format-table
+ft
+format-wide
+fw
+out-string
+out-host
+write-output
+write-host
+echo

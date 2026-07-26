@@ -9,7 +9,7 @@ payload from stdin and decides, per tool call, whether to allow or deny it:
   * Edit / Write / MultiEdit / NotebookEdit -> allow ONLY if the target path is
     inside the working folder; deny anything that escapes it (absolute paths,
     ".." traversal, other drives)
-  * Bash (shell / app execution):
+  * Bash / PowerShell (shell / app execution):
       - edit mode    -> deny (shell is off)
       - confirm mode -> ask the server (/api/hook/permission), which surfaces an
         approval prompt to the user and blocks until they answer; allow/deny per
@@ -137,10 +137,11 @@ def main():
     if tool in READ_ONLY:
         decide("allow", "read-only tool")
 
-    if tool == "Bash" or tool.startswith("Bash") or tool == "KillShell":
+    if (tool in ("Bash", "PowerShell", "KillShell")
+            or tool.startswith("Bash") or tool.startswith("PowerShell")):
         if mode == "confirm":
             ask_user(data)   # blocks; emits allow/deny per the user's choice
-        decide("deny", "編集モードではシェル実行(Bash)は無効です。"
+        decide("deny", "編集モードではシェル実行(Bash/PowerShell)は無効です。"
                        "「実行（都度確認）」モードに切り替えてください。")
 
     if tool in FILE_WRITE:

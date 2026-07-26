@@ -27,12 +27,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from safe_shell import is_safe_command   # read-only-command allowlist (auto-approve)
+from safe_shell import is_safe_command, is_safe_powershell   # read-only-command allowlists (auto-approve)
 
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.3"
+APP_VERSION = "0.8.4"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -76,10 +76,11 @@ PERSONA = (
 # Three modes, chosen per-message from the UI:
 #   advisory - read-only exploration, no file/shell access.
 #   edit     - file editing (Edit/Write) confined to the working folder; no shell.
-#   confirm  - file editing confined to the folder PLUS shell/app execution (Bash),
-#              but every Bash command is approved by the user one at a time (the
-#              guard hook calls back to /api/hook/permission and blocks until the
-#              browser answers). This is the UI default.
+#   confirm  - file editing confined to the folder PLUS shell/app execution
+#              (Bash and PowerShell), but every shell command is approved by the
+#              user one at a time (the guard hook calls back to
+#              /api/hook/permission and blocks until the browser answers). This
+#              is the UI default.
 #
 # IMPORTANT safety note: in headless (-p) mode there is NO built-in classifier or
 # path confinement. A tool listed in --allowedTools runs unconditionally and can
@@ -90,9 +91,13 @@ PERSONA = (
 # (verified), so Bash can be allow-listed in confirm mode while the hook still
 # blocks every command the user hasn't approved.
 ADVISORY_TOOLS = ["Read", "Glob", "Grep"]
-EDIT_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write"]            # no Bash; hook confines writes
-CONFIRM_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash"]  # Bash gated per-command by the hook
+EDIT_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write"]            # no shell; hook confines writes
+# Bash & PowerShell are both gated per-command by the guard hook in confirm mode.
+CONFIRM_TOOLS = ["Read", "Glob", "Grep", "Edit", "Write", "Bash", "PowerShell"]
 TOOLS_BY_MODE = {"advisory": ADVISORY_TOOLS, "edit": EDIT_TOOLS, "confirm": CONFIRM_TOOLS}
+# Tool names that execute a shell command line (gated per-command in confirm
+# mode; each carries the command in tool_input["command"]).
+SHELL_TOOLS = ("Bash", "PowerShell")
 HOOK_MODES = ("edit", "confirm")   # modes that register the guard hook
 GUARD_HOOK = APP_DIR / "edit_guard.py"
 STREAM_INACTIVITY_TIMEOUT = 300    # kill claude after this many seconds of no output (paused while awaiting approval)
@@ -731,7 +736,11 @@ def request_permission(run_id, tool, tool_input):
     if not run:
         return "deny"   # no active stream to ask through
     command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
-    if tool == "Bash" and is_safe_command(command):
+    # Auto-approve provably read-only shell commands (the card is still shown for
+    # visibility). Bash and PowerShell each have their own syntax-aware checker.
+    auto_safe = ((tool == "Bash" and is_safe_command(command)) or
+                 (tool == "PowerShell" and is_safe_powershell(command)))
+    if auto_safe:
         run["queue"].put(("perm_request", {
             "id": uuid.uuid4().hex, "tool": tool, "command": command,
             "input": tool_input, "auto": True,
@@ -776,7 +785,7 @@ def request_permission(run_id, tool, tool_input):
     # A committed change is now recorded; wipe the per-project "which models did
     # the work" memo so the next batch of changes starts a fresh contributor list
     # (the commit message the user just approved already carries the old names).
-    if decision == "allow" and tool == "Bash" and _is_git_commit(command):
+    if decision == "allow" and tool in SHELL_TOOLS and _is_git_commit(command):
         clear_contributors(CONFIG["current"])
     return decision
 

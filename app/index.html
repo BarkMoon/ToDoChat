@@ -385,8 +385,8 @@ let busy = false;
 
 const MODE_TITLES = {
   advisory: 'Read/Glob/Grepのみ（ファイル編集・コマンド実行なし）',
-  edit: '作業フォルダ内のファイル編集(Edit/Write)を許可。シェル実行(Bash)は無効。フォルダ外への書込は拒否。',
-  confirm: 'ファイル編集に加え、シェル/アプリ実行(Bash)を1コマンドずつ許可を求めて実行。フォルダ外への書込は拒否。',
+  edit: '作業フォルダ内のファイル編集(Edit/Write)を許可。シェル実行(Bash/PowerShell)は無効。フォルダ外への書込は拒否。',
+  confirm: 'ファイル編集に加え、シェル/アプリ実行(Bash/PowerShell)を1コマンドずつ許可を求めて実行。フォルダ外への書込は拒否。',
 };
 function currentMode(){ return modeSel.value; }
 function updateModeStyle(){
@@ -621,7 +621,7 @@ function permissionCard(ev){
   card.className = 'perm-card';
   const head = document.createElement('div');
   head.className = 'perm-head';
-  head.textContent = ev.tool === 'Bash' ? '▶️ このコマンドを実行しますか？' : `▶️ ${ev.tool} を許可しますか？`;
+  head.textContent = (ev.tool === 'Bash' || ev.tool === 'PowerShell') ? '▶️ このコマンドを実行しますか？' : `▶️ ${ev.tool} を許可しますか？`;
   const cmd = document.createElement('pre');
   cmd.className = 'perm-cmd';
   cmd.textContent = ev.command || JSON.stringify(ev.input || {}, null, 2);   // textContent = XSS-safe
