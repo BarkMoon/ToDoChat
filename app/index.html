@@ -977,7 +977,17 @@ document.getElementById('memBtn').addEventListener('click', openMemory);
 document.getElementById('memClose').addEventListener('click', closeMemory);
 memSaveBtn.addEventListener('click', saveMemory);
 memDelBtn.addEventListener('click', deleteMemory);
-memModal.addEventListener('click', (e) => { if (e.target === memModal) closeMemory(); });
+// オーバーレイの背景をクリックした時だけ閉じる。文章をドラッグ選択して
+// ウィンドウ外で離した場合（mousedownが中・mouseupが背景）では閉じない。
+function bindOverlayClose(modal, closeFn) {
+  let downOnOverlay = false;
+  modal.addEventListener('mousedown', (e) => { downOnOverlay = (e.target === modal); });
+  modal.addEventListener('mouseup', (e) => {
+    if (downOnOverlay && e.target === modal) closeFn();
+    downOnOverlay = false;
+  });
+}
+bindOverlayClose(memModal, closeMemory);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !memModal.hidden) closeMemory(); });
 
 // ---- contributor memo viewer / editor (🏷️ button) ----
@@ -1023,7 +1033,7 @@ document.getElementById('modelsBtn').addEventListener('click', openModels);
 document.getElementById('modelsClose').addEventListener('click', closeModels);
 modelsSaveBtn.addEventListener('click', saveModels);
 modelsDelBtn.addEventListener('click', deleteModels);
-modelsModal.addEventListener('click', (e) => { if (e.target === modelsModal) closeModels(); });
+bindOverlayClose(modelsModal, closeModels);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modelsModal.hidden) closeModels(); });
 
 async function send(){
@@ -1136,7 +1146,7 @@ lanModeSel.addEventListener('change', async () => {
 
 document.getElementById('settingsBtn').addEventListener('click', openSettings);
 document.getElementById('settingsClose').addEventListener('click', closeSettings);
-settingsModal.addEventListener('click', (e) => { if (e.target === settingsModal) closeSettings(); });
+bindOverlayClose(settingsModal, closeSettings);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !settingsModal.hidden) closeSettings(); });
 renderEnterMode();
 
