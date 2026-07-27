@@ -1,7 +1,8 @@
 # ToDoChat タスク
 
 ## 進行中
-- [ ] PWA全画面化の実機最終確認（案A: Tailscale serve でHTTPS配信）。実装は完了（下記「完了」参照）。残りはユーザー側の一度きりの作業＝①Tailscale管理コンソールで「HTTPS Certificates」を有効化（現状 `CertDomains: None` ＝未有効。未有効だと `tailscale serve --bg` が証明書取得待ちでブロックする）、②有効化後にアプリ再起動→⚙️設定の「🔒 全画面PWA用（Tailscale HTTPS）」に出る `https://desktop-41gnrgo.tail0a7381.ts.net/` をAndroidで開き、ホーム画面追加が全画面（standalone）表示になることを確認。
+- [ ] コンテキスト使用量バーの改善（詳細は着手時に説明）。
+- [ ] 終了時記憶保存時のオーバーヘッドの削減（詳細は着手時に説明）。
 
 ## 次の候補
 （リモート接続ロードマップ。ステップ①HOST可変化・同一WiFi疎通は「LAN接続をデフォルト化」等で完了済み。②トークン認証も完了。本命の接続経路はTailscale、ポート開放/公開トンネルは非推奨）
@@ -9,6 +10,7 @@
 - [ ]（任意）ネイティブAndroid化＋プッシュ通知（後回しでよい）
 
 ## 完了
+- [x] PWA全画面化の実機最終確認（案A: Tailscale serve でHTTPS配信）。Tailscale管理コンソールで「HTTPS Certificates」を有効化のうえ、⚙️設定の「🔒 全画面PWA用（Tailscale HTTPS）」に出る `https://desktop-41gnrgo.tail0a7381.ts.net/` をAndroidで開き、ホーム画面追加が全画面（standalone）表示になることを実機で確認済み。
 - [x] PWA全画面化のためのTailscale HTTPS配信（案A: `tailscale serve`）。`server.py` に `_ts_dns_name()`（`tailscale status --json` の `Self.DNSName` をUTF-8明示デコードで取得・キャッシュ）、`tailscale_serve_url()`（LANモード時に `https://<MagicDNS名>/` を返す。serveはTLS終端後に127.0.0.1からプロキシ＝loopback信頼でトークン不要のため `?token=` を付けない）、`_ensure_tailscale_serve()`（起動時にLANモードなら別スレッドでベストエフォート実行。`_serve_already_fronts_port()` の読取りチェックで既設定なら即スキップ＝毎起動の再ブロック回避、未設定時のみ `tailscale serve --bg --https=443 http://127.0.0.1:PORT` を時間上限付きで試行）を追加。Tailscale実行ファイル探索を `_TS_EXES` に共通化。`list_projects`/`regenerate_token` の応答と起動時コンソールに `tailscale_serve_url` を追加。`index.html` の⚙️設定に「🔒 全画面PWA用（Tailscale HTTPS）」枠（URL＋QR・トークン不要の注記）を追加、`renderQrBlock()` にラベル引数を追加。実機のMagicDNS名 `desktop-41gnrgo.tail0a7381.ts.net` の検出・serve URL生成・両API応答への反映を検証済み（cp932デコード事故を修正）。※実際のHTTPS疎通＝全画面表示は管理コンソールでHTTPS Certificates有効化後に確認（進行中タスク参照）。トークン認証の厳密化は将来タスクへ。APP_VERSION 0.8.5→0.8.6
 - [x] PWA基盤の追加（ホーム画面追加対応）。`app/manifest.webmanifest`（name/short_name/display=standalone/theme・background色/icons）と `app/sw.js`（最小のfetchパススルーSW）、`app/icons/{icon-192,512,180}.png`（stdlibのzlib+structで生成、生成器 `app/gen_icons.py`）を追加。`server.py` の `do_GET` に `/manifest.webmanifest`・`/sw.js`（ルート配信でスコープ確保）・`/icons/*.png` のルートと `_send_static()` を追加（パストラバーサル防御あり）。`index.html` にPWA用meta（theme-color・apple-mobile-web-app-*・manifest・apple-touch-icon）＋`viewport-fit=cover`＋SW登録スクリプトを追加。HTTP経由でE2E検証済み（全ルート正常・PNGシグネチャ/寸法正常・トラバーサル防御OK）。Android実機でホーム画面追加を確認（※全画面化は別タスク＝要HTTPS）。APP_VERSION 0.8.4→0.8.5
 - [x] 設定ウィンドウに外出先用（Tailscale）のアドレス＋QRを追加。サーバーが Tailscale IP（`100.64.0.0/10`）を自動検出（`app/server.py` の `_tailscale_ip()`：`tailscale ip -4` を優先、失敗時は自ホストアドレスからCGNAT帯を走査、`_is_cgnat()` で判定、`_TS_IP_CACHE` でメモ化）し、`tailscale_auth_url()` を `list_projects`/`regenerate_token` の応答に `tailscale_url` として追加。⚙️設定の接続トークン欄を「📶 同一Wi-Fi用（LAN）」「🌐 外出先用（Tailscale VPN）」の2枠に分け、それぞれURL＋QRを出し分け（`renderQrBlock()`）。起動時コンソールにも外出先URLを表示。実IP `100.99.133.53` の検出・LAN/Tailscale両URL生成・CGNAT境界判定をバックエンド検証済み。`docs/Tailscale接続.md` を実装済み表記に更新。APP_VERSION 0.8.2→0.8.3
