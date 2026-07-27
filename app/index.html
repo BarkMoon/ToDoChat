@@ -216,8 +216,25 @@
   .btn-danger:hover { border-color: #f85149; }
   .btn-danger:disabled { opacity: .5; cursor: default; }
 
+  /* settings modal: genre tabs */
+  .set-tabs {
+    display: flex; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid var(--border);
+    flex: none; overflow-x: auto;
+  }
+  .set-tab {
+    background: none; border: none; color: var(--muted); font: inherit; font-size: 13px;
+    padding: 8px 12px; cursor: pointer; border-bottom: 2px solid transparent;
+    border-radius: 6px 6px 0 0; white-space: nowrap; margin-bottom: -1px;
+  }
+  .set-tab:hover { color: var(--text); }
+  .set-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
   /* settings modal rows */
-  .set-body { padding: 8px 16px 16px; display: flex; flex-direction: column; gap: 6px; }
+  .set-body { padding: 8px 16px 16px; display: flex; flex-direction: column; gap: 6px;
+    flex: 1; min-height: 0; overflow-y: auto; }
+  .set-panel { display: flex; flex-direction: column; gap: 6px; }
+  .set-panel[hidden] { display: none; }
+  .set-row [id^="auth"] svg, .set-row [id$="Qr"] svg { max-width: 100%; height: auto; }
   .set-row {
     display: flex; align-items: center; gap: 14px; padding: 12px 2px;
     border-bottom: 1px solid var(--border);
@@ -335,7 +352,12 @@
         <span class="spacer"></span>
         <button class="iconbtn" id="settingsClose" title="閉じる">✕</button>
       </div>
+      <div class="set-tabs" role="tablist">
+        <button class="set-tab active" data-tab="general" role="tab">⚙️ 一般</button>
+        <button class="set-tab" data-tab="conn" role="tab">📶 接続・共有</button>
+      </div>
       <div class="set-body">
+        <div class="set-panel" data-panel="general">
         <div class="set-row">
           <div class="set-label">
             <div class="set-title">入力欄のEnterキー</div>
@@ -346,6 +368,15 @@
             <option value="send">Enterで送信 / Shift+Enterで改行</option>
           </select>
         </div>
+        <div class="set-row">
+          <div class="set-label">
+            <div class="set-title">Windowsスタートアップ登録</div>
+            <div class="set-note">Windowsサインイン時にToDoChatを自動起動します（タスクスケジューラに登録。切替時に管理者確認が出ます）。</div>
+          </div>
+          <button class="pilltoggle" id="startupBtn" title="Windowsサインイン時にToDoChatを自動起動します（タスクスケジューラに登録）。">🚀 登録<span class="sw" id="startupState">…</span></button>
+        </div>
+        </div>
+        <div class="set-panel" data-panel="conn" hidden>
         <div class="set-row">
           <div class="set-label">
             <div class="set-title">接続モード（待受アドレス）</div>
@@ -368,15 +399,13 @@
             <div class="set-note" style="margin-top:14px;"><b>🌐 外出先用（Tailscale VPN）</b></div>
             <div class="set-note" id="tsInfo"></div>
             <div id="authTsQr" title="外出先のスマホでTailscaleをONにしてこのQRを読むと初回認証が済みます。" style="margin-top:4px;"></div>
+            <div class="set-note" style="margin-top:14px;"><b>🔒 全画面PWA用（Tailscale HTTPS）</b></div>
+            <div class="set-note">このHTTPS URLを開くとスマホのホーム画面追加が全画面（standalone）表示になります。TailscaleがHTTPS終端するためトークン不要（Tailscaleに参加している端末のみ到達可）。管理コンソールで「HTTPS Certificates」の有効化が必要です。</div>
+            <div class="set-note" id="tsServeInfo"></div>
+            <div id="authTsServeQr" title="TailscaleをONにしたスマホでこのQRを読み、ホーム画面に追加すると全画面PWAになります。" style="margin-top:4px;"></div>
           </div>
           <button class="pilltoggle" id="authRegenBtn" title="接続トークンを再生成します（既存端末は再認証が必要になります）。">🔑 再生成</button>
         </div>
-        <div class="set-row">
-          <div class="set-label">
-            <div class="set-title">Windowsスタートアップ登録</div>
-            <div class="set-note">Windowsサインイン時にToDoChatを自動起動します（タスクスケジューラに登録。切替時に管理者確認が出ます）。</div>
-          </div>
-          <button class="pilltoggle" id="startupBtn" title="Windowsサインイン時にToDoChatを自動起動します（タスクスケジューラに登録）。">🚀 登録<span class="sw" id="startupState">…</span></button>
         </div>
       </div>
     </div>
@@ -731,6 +760,7 @@ async function loadProjects(){
     authToken = data.auth_token || '';     // token for phone/VPN auth
     authUrl = data.lan_url || '';          // LAN one-tap login URL (empty if loopback)
     tsUrl = data.tailscale_url || '';      // Tailscale one-tap URL (empty if unavailable)
+    tsServeUrl = data.tailscale_serve_url || '';  // Tailscale HTTPS URL for full-screen PWA (empty if unavailable)
     renderAuth();
   } catch (_) {}
 }
@@ -1178,10 +1208,13 @@ const lanInfo = document.getElementById('lanInfo');
 const authQr = document.getElementById('authQr');
 const tsInfo = document.getElementById('tsInfo');
 const authTsQr = document.getElementById('authTsQr');
+const tsServeInfo = document.getElementById('tsServeInfo');
+const authTsServeQr = document.getElementById('authTsServeQr');
 const authRegenBtn = document.getElementById('authRegenBtn');
 let authToken = '';   // current server token
 let authUrl = '';     // LAN login URL (empty while server is loopback-only)
 let tsUrl = '';       // Tailscale (outside-LAN) login URL (empty if unavailable)
+let tsServeUrl = '';  // Tailscale HTTPS URL for full-screen PWA (empty if unavailable)
 
 // ---- minimal QR encoder (byte mode, EC level M, versions 1-10) ----
 // Self-contained: no CDN/library so the QR renders offline on the LAN. The
@@ -1381,10 +1414,14 @@ function renderAuth(){
   // Outside-the-LAN (Tailscale) URL + QR.
   renderQrBlock(tsInfo, authTsQr, tsUrl,
     'Tailscale未検出（PC・スマホにTailscaleを入れ同一アカウントでログインすると外出先用URLが表示されます）。');
+  // Full-screen PWA (Tailscale HTTPS via serve) URL + QR. No token in this URL.
+  renderQrBlock(tsServeInfo, authTsServeQr, tsServeUrl,
+    'Tailscale未検出、またはMagicDNS名が取得できません（TailscaleをONにし管理コンソールでHTTPS Certificatesを有効化すると表示されます）。',
+    'HTTPS URL: ');
 }
 // Fill one info line + its QR from a login URL, or show a fallback note when empty.
-function renderQrBlock(infoEl, qrEl, url, emptyMsg){
-  infoEl.textContent = url ? ('スマホ用URL: ' + url) : emptyMsg;
+function renderQrBlock(infoEl, qrEl, url, emptyMsg, label){
+  infoEl.textContent = url ? ((label || 'スマホ用URL: ') + url) : emptyMsg;
   infoEl.style.whiteSpace = 'pre-wrap';
   infoEl.style.wordBreak = 'break-all';
   qrEl.textContent = '';
@@ -1399,10 +1436,23 @@ authRegenBtn.addEventListener('click', async () => {
   authRegenBtn.disabled = true;
   try {
     const r = await api('/api/auth/regenerate', {});
-    if (r.ok){ authToken = r.auth_token || ''; authUrl = r.lan_url || ''; tsUrl = r.tailscale_url || ''; renderAuth(); }
+    if (r.ok){ authToken = r.auth_token || ''; authUrl = r.lan_url || ''; tsUrl = r.tailscale_url || ''; tsServeUrl = r.tailscale_serve_url || ''; renderAuth(); }
   } catch(_){}
   authRegenBtn.disabled = false;
 });
+
+// ---- settings genre tabs ----
+(function(){
+  const tabs = settingsModal.querySelectorAll('.set-tab');
+  const panels = settingsModal.querySelectorAll('.set-panel');
+  const body = settingsModal.querySelector('.set-body');
+  tabs.forEach(tab => tab.addEventListener('click', () => {
+    const name = tab.dataset.tab;
+    tabs.forEach(t => t.classList.toggle('active', t === tab));
+    panels.forEach(p => { p.hidden = p.dataset.panel !== name; });
+    body.scrollTop = 0;
+  }));
+})();
 
 document.getElementById('settingsBtn').addEventListener('click', openSettings);
 document.getElementById('settingsClose').addEventListener('click', closeSettings);

@@ -99,6 +99,22 @@
 
 ---
 
+## スマホで全画面（PWA・standalone）にする — Tailscale HTTPS 配信
+
+ホーム画面に追加したToDoChatを**アドレスバーなしの全画面**で開くには、HTTPSでの配信が必要（Service Worker は HTTPS か localhost でしか登録できず、平文HTTPだとAndroidはブラウザのショートカット扱いになる）。Tailscale の `serve` を使うと、証明書の発行・更新を Tailscale に任せてHTTPS化できる。
+
+### 一度だけの準備
+1. **管理コンソールで「HTTPS Certificates」を有効化**する（[https://login.tailscale.com/admin/dns](https://login.tailscale.com/admin/dns) の「HTTPS Certificates」）。あわせて **MagicDNS** も有効にしておく。
+   - 未有効のままだと `tailscale serve` が証明書を取得できず起動時にブロックする（ToDoChatは時間上限で自衛するので起動自体は止まらないが、HTTPSは繋がらない）。
+
+### 使い方
+- ToDoChat は **LANモードでの起動時に自動で** `tailscale serve --bg --https=443 http://127.0.0.1:8765` を実行してHTTPS配信を用意する（既に設定済みなら何もしない）。手動でやる場合も同じコマンドでよい。
+- ⚙️設定ウィンドウの接続トークン欄の **「🔒 全画面PWA用（Tailscale HTTPS）」** に出る `https://<PC名>.<tailnet>.ts.net/` を、Tailscale をONにしたスマホで開く → メニューから「ホーム画面に追加」で**全画面PWA**になる。
+- このHTTPS URLは **トークン不要**（Tailscale がTLS終端し、ToDoChatにはPC内のloopbackとして届くため。tailnetに参加している端末だけが到達できる）。
+- 解除したいときは `tailscale serve reset`。
+
+---
+
 ## セキュリティ上の注意
 
 - Tailscale 経由の通信は WireGuard で暗号化されるため、平文HTTPでも tailnet 外からは覗けない。**LANの平文HTTPより外出先向けとして安全**。
@@ -110,3 +126,5 @@
 ## 実装済みメモ
 
 - ⚙️設定ウィンドウの接続トークン欄は、LAN用に加えて **Tailscale IP を自動検出して外出先用のURL＋QRを併記**する（サーバー側で `tailscale ip -4` を取得し、失敗時は自ホストのアドレスから `100.64.0.0/10` を走査。`app/server.py` の `_tailscale_ip()`）。外出先接続時にTailscale IPを手で調べる必要はない。
+- **全画面PWA用のHTTPS配信**は、起動時にLANモードなら `_ensure_tailscale_serve()` が別スレッドで `tailscale serve --bg --https=443 http://127.0.0.1:PORT` をベストエフォート実行する（`_serve_already_fronts_port()` で既設定なら即スキップ）。MagicDNS名は `_ts_dns_name()`（`tailscale status --json` の `Self.DNSName`）で取得し、`tailscale_serve_url()` が `https://<MagicDNS名>/` を組み立てて⚙️設定へ渡す。
+  - serve 経由はTLS終端後に `127.0.0.1` からプロキシされるため、現状の `_authenticate()` のloopback無条件許可により**トークン認証はかからない**（tailnet参加端末のみ到達可という前提での割り切り）。より厳密にするなら serve 付与ヘッダで経由を判定してトークンを要求する改修が将来タスク。

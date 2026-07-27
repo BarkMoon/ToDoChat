@@ -32,7 +32,7 @@ from safe_shell import is_safe_command, is_safe_powershell   # read-only-command
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.5"
+APP_VERSION = "0.8.6"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -210,7 +210,8 @@ def regenerate_token():
     CONFIG["auth_token"] = AUTH_TOKEN
     save_config(CONFIG)
     return {"ok": True, "auth_token": AUTH_TOKEN, "lan_url": lan_auth_url(),
-            "tailscale_url": tailscale_auth_url()}
+            "tailscale_url": tailscale_auth_url(),
+            "tailscale_serve_url": tailscale_serve_url()}
 
 
 def lan_auth_url():
@@ -922,6 +923,9 @@ def list_projects():
             "lan_url": lan_auth_url(),
             # Outside-the-LAN one-tap URL over Tailscale (empty if unavailable).
             "tailscale_url": tailscale_auth_url(),
+            # HTTPS URL via `tailscale serve` for full-screen PWA install (empty if
+            # unavailable). No token: serve proxies from loopback, which is trusted.
+            "tailscale_serve_url": tailscale_serve_url(),
             "version": version_string()}
 
 
@@ -1906,6 +1910,10 @@ def _is_cgnat(ip):
     return octets[0] == 100 and 64 <= octets[1] <= 127
 
 
+# Candidate paths for the tailscale CLI: PATH first, then the default Windows
+# install location (the Tailscale MSI doesn't always put it on PATH).
+_TS_EXES = ("tailscale", r"C:\Program Files\Tailscale\tailscale.exe")
+
 _TS_IP_CACHE = ""
 
 
@@ -1918,7 +1926,7 @@ def _tailscale_ip():
     global _TS_IP_CACHE
     if _TS_IP_CACHE:
         return _TS_IP_CACHE
-    for exe in ("tailscale", r"C:\Program Files\Tailscale\tailscale.exe"):
+    for exe in _TS_EXES:
         try:
             r = subprocess.run([exe, "ip", "-4"], capture_output=True,
                                text=True, timeout=3)
@@ -1940,6 +1948,89 @@ def _tailscale_ip():
     except OSError:
         pass
     return ""
+
+
+_TS_DNS_CACHE = None
+
+
+def _ts_dns_name():
+    """MagicDNS name of this machine (e.g. 'host.tailnet.ts.net'), '' when Tailscale
+    isn't up or MagicDNS is off. Read from `tailscale status --json` (Self.DNSName)
+    and cached -- the name is stable for the process's lifetime. This name (not the
+    raw 100.x IP) is what Tailscale's HTTPS certificate is issued for, so it's the
+    address a phone must dial to get a valid-cert HTTPS connection via `serve`."""
+    global _TS_DNS_CACHE
+    if _TS_DNS_CACHE is not None:
+        return _TS_DNS_CACHE
+    _TS_DNS_CACHE = ""
+    for exe in _TS_EXES:
+        try:
+            # `tailscale status --json` emits UTF-8; decode it explicitly so a
+            # non-ASCII byte doesn't blow up under the Windows console's cp932.
+            r = subprocess.run([exe, "status", "--json"], capture_output=True,
+                               encoding="utf-8", errors="replace", timeout=4)
+        except (OSError, subprocess.TimeoutExpired):
+            continue  # not this path (or hung) -- try the next candidate
+        try:
+            d = json.loads(r.stdout)
+        except (ValueError, TypeError):
+            break  # CLI ran but gave no parseable JSON; don't retry the same binary
+        _TS_DNS_CACHE = ((d.get("Self") or {}).get("DNSName") or "").rstrip(".")
+        break
+    return _TS_DNS_CACHE
+
+
+def tailscale_serve_url():
+    """HTTPS URL a phone opens once `tailscale serve` fronts this server (see
+    _ensure_tailscale_serve). Empty when loopback-only or no MagicDNS name. Under
+    serve, tailscaled terminates TLS and proxies from loopback, so requests arrive
+    as 127.0.0.1 and are trusted WITHOUT a token -- hence no ?token= here. A valid
+    HTTPS origin is what lets Android install ToDoChat as a full-screen (standalone)
+    PWA; plain HTTP can't register the service worker."""
+    if BIND_HOST in ("127.0.0.1", "localhost"):
+        return ""
+    name = _ts_dns_name()
+    if not name:
+        return ""
+    return f"https://{name}/"
+
+
+def _serve_already_fronts_port(exe):
+    """True if `tailscale serve` is already proxying HTTPS to our loopback:PORT.
+    The serve config lives in tailscaled and persists across reboots, so once set
+    up we must NOT re-run `serve` on every startup -- re-running blocks while it
+    (re)acquires the cert. A quick read-only status check lets us skip when done."""
+    try:
+        r = subprocess.run([exe, "serve", "status"], capture_output=True,
+                           encoding="utf-8", errors="replace", timeout=4)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return f"127.0.0.1:{PORT}" in (r.stdout or "")
+
+
+def _ensure_tailscale_serve():
+    """Best-effort: front this HTTP server with Tailscale HTTPS (port 443 -> proxy
+    to 127.0.0.1:PORT) so a phone can install ToDoChat as a full-screen PWA. TLS is
+    terminated by tailscaled; our server stays plain HTTP and needs no cert code.
+    Non-fatal: silently does nothing when Tailscale is absent/down. Runs only in LAN
+    mode. Skips the mutating call when serve already fronts our port (config
+    persists in tailscaled), so a normal startup only does a cheap status read.
+
+    Note: the tailnet's 'HTTPS Certificates' feature must be enabled in the admin
+    console. Until it is, `serve --bg` blocks trying to obtain a cert; the timeout
+    below bounds that so startup is never held up (this runs in a daemon thread)."""
+    if BIND_HOST in ("127.0.0.1", "localhost"):
+        return
+    for exe in _TS_EXES:
+        if _serve_already_fronts_port(exe):
+            return  # already configured -- nothing to do (and don't risk blocking)
+        try:
+            subprocess.run([exe, "serve", "--bg", "--https=443",
+                            f"http://127.0.0.1:{PORT}"],
+                           capture_output=True, timeout=20)
+            return  # this binary handled it (success or benign timeout); done
+        except (OSError, subprocess.TimeoutExpired):
+            continue  # not this path (or hung on cert) -- try the next candidate
 
 
 def main():
@@ -1966,8 +2057,16 @@ def main():
         ts_ip = _tailscale_ip()
         if ts_ip:
             print(f"  外出先  : Tailscale経由は http://{ts_ip}:{PORT}/ で接続（初回のみ ?token= 付きURL）")
+        serve_url = tailscale_serve_url()
+        if serve_url:
+            print(f"  全画面  : {serve_url} （Tailscale HTTPS/serve経由。スマホでPWA全画面インストール可・トークン不要）")
+            print("            ※管理コンソールでHTTPS Certificatesの有効化が必要。初回接続時に証明書発行で数秒かかる場合あり")
         print("  （PC本体＝loopbackはトークン不要。トークンは⚙️設定でも確認/再生成できます）")
     print("Press Ctrl+C to stop.")
+    # Front the server with Tailscale HTTPS in the background (best-effort; keeps
+    # startup snappy since cert provisioning / CLI can take a moment).
+    if BIND_HOST not in ("127.0.0.1", "localhost"):
+        threading.Thread(target=_ensure_tailscale_serve, daemon=True).start()
     threading.Timer(0.8, lambda: open_app_window(url)).start()
     try:
         server.serve_forever()
