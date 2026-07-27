@@ -1,14 +1,14 @@
 # ToDoChat タスク
 
 ## 進行中
-- （なし）
+- [ ] PWAの全画面（standalone）表示を実現する。Android実機でホーム画面追加は成功したが、起動時にブラウザのアドレスバー等が残り全画面化されない。原因は平文HTTP接続ではService Workerが登録できず（SWはHTTPS/localhostが前提）、Androidが完全なPWAとしてインストールせずブラウザのショートカット扱いになっているため。対応候補: (a) TailscaleのHTTPS（`tailscale cert`／`tailscale serve`）で配信、(b) 自己署名証明書＋HTTPS待受、(c) LAN内は割り切ってショートカット運用。まず配信をHTTPS化する経路を検討する。
 
 ## 次の候補
 （リモート接続ロードマップ。ステップ①HOST可変化・同一WiFi疎通は「LAN接続をデフォルト化」等で完了済み。②トークン認証も完了。本命の接続経路はTailscale、ポート開放/公開トンネルは非推奨）
-- [ ] UIモバイル対応の仕上げ＋PWA化（スマホのホーム画面追加・全画面表示。同期/改行キー等のモバイル対応は一部実装済み）
 - [ ]（任意）ネイティブAndroid化＋プッシュ通知（後回しでよい）
 
 ## 完了
+- [x] PWA基盤の追加（ホーム画面追加対応）。`app/manifest.webmanifest`（name/short_name/display=standalone/theme・background色/icons）と `app/sw.js`（最小のfetchパススルーSW）、`app/icons/{icon-192,512,180}.png`（stdlibのzlib+structで生成、生成器 `app/gen_icons.py`）を追加。`server.py` の `do_GET` に `/manifest.webmanifest`・`/sw.js`（ルート配信でスコープ確保）・`/icons/*.png` のルートと `_send_static()` を追加（パストラバーサル防御あり）。`index.html` にPWA用meta（theme-color・apple-mobile-web-app-*・manifest・apple-touch-icon）＋`viewport-fit=cover`＋SW登録スクリプトを追加。HTTP経由でE2E検証済み（全ルート正常・PNGシグネチャ/寸法正常・トラバーサル防御OK）。Android実機でホーム画面追加を確認（※全画面化は別タスク＝要HTTPS）。APP_VERSION 0.8.4→0.8.5
 - [x] 設定ウィンドウに外出先用（Tailscale）のアドレス＋QRを追加。サーバーが Tailscale IP（`100.64.0.0/10`）を自動検出（`app/server.py` の `_tailscale_ip()`：`tailscale ip -4` を優先、失敗時は自ホストアドレスからCGNAT帯を走査、`_is_cgnat()` で判定、`_TS_IP_CACHE` でメモ化）し、`tailscale_auth_url()` を `list_projects`/`regenerate_token` の応答に `tailscale_url` として追加。⚙️設定の接続トークン欄を「📶 同一Wi-Fi用（LAN）」「🌐 外出先用（Tailscale VPN）」の2枠に分け、それぞれURL＋QRを出し分け（`renderQrBlock()`）。起動時コンソールにも外出先URLを表示。実IP `100.99.133.53` の検出・LAN/Tailscale両URL生成・CGNAT境界判定をバックエンド検証済み。`docs/Tailscale接続.md` を実装済み表記に更新。APP_VERSION 0.8.2→0.8.3
 - [x] Tailscale（VPN）で外出先対応。導入手順を `docs/Tailscale接続.md` に文書化（PC/スマホのインストール〜tailnet参加〜トークン付きURLでのログイン〜トラブルシュート）。ToDoChatはLANモード（`0.0.0.0`待受）ならTailscale仮想アダプタでも自動で受かるためサーバー側の改修は不要。実機E2E検証済み（スマホからPCのTailscale IP `100.x` でトークンログイン→会話往復→🔄同期→🔧確認カードの許可→実行まで成功）。フックコールバックは `HOST=127.0.0.1` 固定でPC内ループバックから叩くためTailscale経由でも無傷。Tailscale仮想アダプタはWindows上で「プライベート」分類のため既存FWルール（`profile=private`）がそのまま適用されFW追加設定は不要と実地確認。`docs/LAN接続.md` からも相互リンク。※設定ウィンドウのQR/URLへのTailscale IP自動併記は任意タスクとして別途（現状は外出先接続時にTailscale IPを手動確認）
 - [x] 接続トークンのQRコード表示。設定ウィンドウの接続トークン欄に、`?token=` 付きスマホ用ログインURLをエンコードしたQRコードを表示（スマホのカメラで読むだけで初回認証が済む導線）。stdlibのみ制約への対処として、URLは既にクライアント側にあることを活かしサーバー（Python）ではなく `app/index.html` にライブラリ非依存の自前QRエンコーダ（バイトモード・EC=M・バージョン1-10・自動バージョン選択・8マスク評価・SVG出力）を内蔵（CDN不要でLANオフラインでも描画）。`renderAuth()` で `authUrl` がある時のみ描画、長すぎる場合はテキストのフォールバック。JSエンコーダをPythonへ忠実移植し「エンコード→独立デコード（RSシンドローム=0検証・フォーマット情報のBCH復号・バイトモードのペイロード往復一致）」でv1/v4/v5（ブロックインターリーブ含む）・マルチバイトUTF-8まで全ケース検証済み

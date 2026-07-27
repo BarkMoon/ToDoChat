@@ -32,7 +32,7 @@ from safe_shell import is_safe_command, is_safe_powershell   # read-only-command
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.4"
+APP_VERSION = "0.8.5"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -1655,6 +1655,26 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass  # connection is probably gone too; log still has the trace
 
+    def _send_static(self, rel):
+        """アプリディレクトリ配下の小さな静的ファイル(PWA の manifest /
+        サービスワーカー / アイコン)を適切な Content-Type で配信する。"""
+        path = APP_DIR / rel
+        try:
+            data = path.read_bytes()
+        except (FileNotFoundError, OSError):
+            self.send_error(404)
+            return
+        ctype = {
+            ".webmanifest": "application/manifest+json; charset=utf-8",
+            ".js": "text/javascript; charset=utf-8",
+            ".png": "image/png",
+        }.get(path.suffix, "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         if not self._authenticate():
             return
@@ -1675,6 +1695,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(html)))
             self.end_headers()
             self.wfile.write(html)
+            return
+        # PWA 用の静的ルート。サービスワーカーはルートスコープ確保のため /sw.js で配信。
+        if self.path in ("/manifest.webmanifest", "/sw.js"):
+            self._send_static(self.path.lstrip("/"))
+        elif self.path.startswith("/icons/"):
+            name = self.path[len("/icons/"):]
+            if "/" in name or "\\" in name or ".." in name or not name.endswith(".png"):
+                self.send_error(404)
+            else:
+                self._send_static("icons/" + name)
         else:
             self.send_error(404)
 
