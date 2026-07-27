@@ -179,6 +179,9 @@
   .modal {
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
     width: 100%; max-width: 560px; max-height: 90vh; display: flex; flex-direction: column;
+  }
+  /* settings modal is wider so the longest select option fits on one line */
+  #settingsModal .modal { max-width: 720px;
     box-shadow: 0 12px 40px rgba(0,0,0,.5);
   }
   .modal-head {
@@ -216,22 +219,25 @@
   .btn-danger:hover { border-color: #f85149; }
   .btn-danger:disabled { opacity: .5; cursor: default; }
 
-  /* settings modal: genre tabs */
+  /* settings modal: genre tabs on the left */
+  .set-main { display: flex; min-height: 0; }
   .set-tabs {
-    display: flex; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid var(--border);
-    flex: none; overflow-x: auto;
+    display: flex; flex-direction: column; gap: 4px; padding: 12px 8px;
+    border-right: 1px solid var(--border); flex: none;
   }
   .set-tab {
     background: none; border: none; color: var(--muted); font: inherit; font-size: 13px;
-    padding: 8px 12px; cursor: pointer; border-bottom: 2px solid transparent;
-    border-radius: 6px 6px 0 0; white-space: nowrap; margin-bottom: -1px;
+    padding: 8px 12px; cursor: pointer; border-left: 2px solid transparent;
+    border-radius: 0 6px 6px 0; white-space: nowrap; text-align: left;
   }
   .set-tab:hover { color: var(--text); }
-  .set-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+  .set-tab.active { color: var(--text); border-left-color: var(--accent); background: var(--panel2); }
 
   /* settings modal rows */
-  .set-body { padding: 8px 16px 16px; display: flex; flex-direction: column; gap: 6px;
-    flex: 1; min-height: 0; overflow-y: auto; }
+  /* Fixed height (~2 full QR items tall) so switching tabs doesn't resize the window;
+     shrinks on short screens so the modal never exceeds its 90vh cap. */
+  .set-body { flex: 1; padding: 8px 16px 16px; display: flex; flex-direction: column; gap: 6px;
+    height: min(600px, calc(90vh - 120px)); min-height: 0; overflow-y: auto; }
   .set-panel { display: flex; flex-direction: column; gap: 6px; }
   .set-panel[hidden] { display: none; }
   .set-row [id^="auth"] svg, .set-row [id$="Qr"] svg { max-width: 100%; height: auto; }
@@ -245,7 +251,8 @@
   .set-note { font-size: 12px; color: var(--muted); line-height: 1.5; }
   .set-row select {
     flex: none; background: var(--panel2); color: var(--text); border: 1px solid var(--border);
-    border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 12px; cursor: pointer; max-width: 55%;
+    border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 12px; cursor: pointer; max-width: 60%;
+    white-space: nowrap;
   }
   .set-row select:focus { outline: none; border-color: var(--accent); }
 </style>
@@ -352,6 +359,7 @@
         <span class="spacer"></span>
         <button class="iconbtn" id="settingsClose" title="閉じる">✕</button>
       </div>
+      <div class="set-main">
       <div class="set-tabs" role="tablist">
         <button class="set-tab active" data-tab="general" role="tab">⚙️ 一般</button>
         <button class="set-tab" data-tab="conn" role="tab">📶 接続・共有</button>
@@ -407,6 +415,7 @@
           <button class="pilltoggle" id="authRegenBtn" title="接続トークンを再生成します（既存端末は再認証が必要になります）。">🔑 再生成</button>
         </div>
         </div>
+      </div>
       </div>
     </div>
   </div>
