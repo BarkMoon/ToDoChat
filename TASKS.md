@@ -5,15 +5,13 @@
 - [ ] 開始時確認メッセージのオーバーヘッド削減。
   - 案A: 挨拶プロンプトへの TASKS.md 注入から `## 完了` セクションを除外（read_tasks を進行中・次の候補までで打ち切り、巨大な完了リストのトークンを削減）。app/server.py の read_tasks / init_greeting_stream 周辺。
   - 案B: 挨拶生成を Haiku 固定に（定型の3セクション要約のため軽量モデルで十分。本番会話は従来モデルのまま）。init_greeting_stream の呼び出しモデルを haiku に固定。
-- [ ] 終了時記憶保存のオーバーヘッド削減。
-  - 案D/E（一体実装）: 論理時刻カウンタで会話の鮮度を管理し、終了時スナップショットが不要なら丸ごとスキップ。apply_memory_block 成功時に LAST_MEMORY_SAVE を、ユーザー発話時に LAST_USER_TURN を更新し、finalize_memory_if_enabled 冒頭で「最後の記憶保存以降に新規ユーザー発話が無ければ snapshot_memory_blocking を呼ばず即終了」と判定。ターン内 TODOCHAT_MEMORY 保存と終了時保存の重複を排除し、終了ボタンの待ち（最大120秒）をほぼ消す。app/server.py の finalize_memory_if_enabled / snapshot_memory_blocking / apply_memory_block 周辺。
-
 ## 次の候補
 （リモート接続ロードマップ。ステップ①HOST可変化・同一WiFi疎通は「LAN接続をデフォルト化」等で完了済み。②トークン認証も完了。本命の接続経路はTailscale、ポート開放/公開トンネルは非推奨）
 - [ ] Tailscale serve 経由アクセスのトークン認証（厳密案）。serve はTLS終端後に `127.0.0.1` からプロキシするため、現状 `_authenticate()` のloopback無条件許可でトークン認証がバイパスされる（＝tailnet参加端末なら誰でも到達可という割り切りで現在は運用）。より厳密にするなら、serve が付与するヘッダ（`Tailscale-User-Login` 等）の有無で「serveプロキシ経由リクエスト」を判定し、その場合はloopback免除を外してトークン（またはTailscaleユーザーID）を要求する。`app/server.py` の `_client_is_loopback()`／`_authenticate()` 周辺。
 - [ ]（任意）ネイティブAndroid化＋プッシュ通知（後回しでよい）
 
 ## 完了
+- [x] 終了時記憶保存のオーバーヘッド削減（案D/E: 論理時刻クロックで鮮度管理）。会話ごとに `LAST_USER_TURN`/`LAST_MEMORY_SAVE` を論理時刻でトラッキングし、`apply_memory_block`／`write_memory`／`remember_stream`／`snapshot_memory_blocking` の各保存経路で `mark_memory_saved`、ユーザー発話開始時に `mark_user_turn` を呼ぶ。`finalize_memory_if_enabled` は `memory_is_fresh`（最後の記憶保存が最後のユーザー発話以降）がTrueなら `snapshot_memory_blocking` を呼ばず即終了し、ターン内 `TODOCHAT_MEMORY` 保存との重複や終了ボタンの待ち（最大120秒）を回避。実機確認済み。APP_VERSION 0.8.8→0.8.9
 - [x] PWA全画面化の実機最終確認（案A: Tailscale serve でHTTPS配信）。Tailscale管理コンソールで「HTTPS Certificates」を有効化のうえ、⚙️設定の「🔒 全画面PWA用（Tailscale HTTPS）」に出る `https://desktop-41gnrgo.tail0a7381.ts.net/` をAndroidで開き、ホーム画面追加が全画面（standalone）表示になることを実機で確認済み。
 - [x] PWA全画面化のためのTailscale HTTPS配信（案A: `tailscale serve`）。`server.py` に `_ts_dns_name()`（`tailscale status --json` の `Self.DNSName` をUTF-8明示デコードで取得・キャッシュ）、`tailscale_serve_url()`（LANモード時に `https://<MagicDNS名>/` を返す。serveはTLS終端後に127.0.0.1からプロキシ＝loopback信頼でトークン不要のため `?token=` を付けない）、`_ensure_tailscale_serve()`（起動時にLANモードなら別スレッドでベストエフォート実行。`_serve_already_fronts_port()` の読取りチェックで既設定なら即スキップ＝毎起動の再ブロック回避、未設定時のみ `tailscale serve --bg --https=443 http://127.0.0.1:PORT` を時間上限付きで試行）を追加。Tailscale実行ファイル探索を `_TS_EXES` に共通化。`list_projects`/`regenerate_token` の応答と起動時コンソールに `tailscale_serve_url` を追加。`index.html` の⚙️設定に「🔒 全画面PWA用（Tailscale HTTPS）」枠（URL＋QR・トークン不要の注記）を追加、`renderQrBlock()` にラベル引数を追加。実機のMagicDNS名 `desktop-41gnrgo.tail0a7381.ts.net` の検出・serve URL生成・両API応答への反映を検証済み（cp932デコード事故を修正）。※実際のHTTPS疎通＝全画面表示は管理コンソールでHTTPS Certificates有効化後に確認（進行中タスク参照）。トークン認証の厳密化は将来タスクへ。APP_VERSION 0.8.5→0.8.6
 - [x] PWA基盤の追加（ホーム画面追加対応）。`app/manifest.webmanifest`（name/short_name/display=standalone/theme・background色/icons）と `app/sw.js`（最小のfetchパススルーSW）、`app/icons/{icon-192,512,180}.png`（stdlibのzlib+structで生成、生成器 `app/gen_icons.py`）を追加。`server.py` の `do_GET` に `/manifest.webmanifest`・`/sw.js`（ルート配信でスコープ確保）・`/icons/*.png` のルートと `_send_static()` を追加（パストラバーサル防御あり）。`index.html` にPWA用meta（theme-color・apple-mobile-web-app-*・manifest・apple-touch-icon）＋`viewport-fit=cover`＋SW登録スクリプトを追加。HTTP経由でE2E検証済み（全ルート正常・PNGシグネチャ/寸法正常・トラバーサル防御OK）。Android実機でホーム画面追加を確認（※全画面化は別タスク＝要HTTPS）。APP_VERSION 0.8.4→0.8.5
