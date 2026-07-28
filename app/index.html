@@ -825,9 +825,17 @@ const modelSel = document.getElementById('model');
 // server saves as the cross-restart hand-off note. It must never be shown, so
 // hide everything from the start marker onward while streaming (the server also
 // strips it from the final reply).
-function stripMemory(s){ const i = s.indexOf('[[TODOCHAT_MEMORY]]'); return i >= 0 ? s.slice(0, i).replace(/\s+$/, '') : s; }
+// Only a marker at the START of a line begins the real block; an inline mention
+// (e.g. the AI explaining this feature in prose or `code`) must not truncate the
+// shown reply. Mirrors the server's line-anchored MEMORY_RE.
+function stripMemory(s){ const m = /^[ \t]*\[\[TODOCHAT_MEMORY\]\]/m.exec(s); return m ? s.slice(0, m.index).replace(/\s+$/, '') : s; }
 async function streamedTurn(path, payload, onFail){
   let live = null, liveIsText = false, liveText = '', final = null;
+  // A permission card or mid-stream notice splits the reply across several
+  // bubbles. When that happens we can't swap in the server's whole-reply text
+  // at the end (it would duplicate the earlier segments), so fall back to the
+  // per-segment streamed text. Untouched in the common single-bubble case.
+  let segmented = false;
   function ensureTyping(){ if (!live){ live = typingBubble(); liveIsText = false; } }
   function textTarget(){
     if (!live){ live = document.createElement('div'); live.className = 'msg ai'; log.appendChild(live); }
@@ -849,12 +857,14 @@ async function streamedTurn(path, payload, onFail){
         liveText += ev.text; t.textContent = stripMemory(liveText);
         log.scrollTop = log.scrollHeight;
       } else if (ev.type === 'permission_request'){
+        segmented = true;
         finalizeLive();
         permissionCard(ev);
         ensureTyping();          // dots while the (approved) command runs / reply continues
       } else if (ev.type === 'notice'){
         // A server-side status note mid-stream (e.g. full-log restore fell back
         // to a fresh greeting). Show it as a sys bubble before the reply resumes.
+        segmented = true;
         finalizeLive();
         bubble(ev.text, ev.cls || 'sys');
         ensureTyping();
@@ -865,9 +875,15 @@ async function streamedTurn(path, payload, onFail){
   } catch (e){
     finalizeLive(); onFail('通信エラー: ' + e); return null;
   }
-  // No text streamed (e.g. tool-only turn) but a final reply exists -> show it.
-  if (final && final.ok && !liveIsText && final.reply && final.reply.trim()){
-    textTarget().textContent = final.reply; liveText = final.reply;
+  // Prefer the server's authoritative, memory-stripped reply for the final
+  // render. Streamed deltas can drop a chunk (a rarely mis-parsed stream line)
+  // and leave the visible text truncated -- often mid-`code span`, which also
+  // exposes the trailing [[TODOCHAT_MEMORY]] block -- while final.reply is the
+  // complete text. Skip this only when the reply was split across bubbles by a
+  // permission card / notice (final.reply is the whole concatenation there),
+  // or when no reply text exists (tool-only turn shows nothing).
+  if (final && final.ok && final.reply && final.reply.trim() && !segmented){
+    textTarget(); liveText = final.reply;
   }
   finalizeLive();
   if (final && final.ok){
