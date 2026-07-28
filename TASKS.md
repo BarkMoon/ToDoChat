@@ -2,15 +2,13 @@
 
 ## 進行中
 - [ ] コンテキスト使用量バーの改善（詳細は着手時に説明）。
-- [ ] 開始時確認メッセージのオーバーヘッド削減。
-  - 案A: 挨拶プロンプトへの TASKS.md 注入から `## 完了` セクションを除外（read_tasks を進行中・次の候補までで打ち切り、巨大な完了リストのトークンを削減）。app/server.py の read_tasks / init_greeting_stream 周辺。
-  - 案B: 挨拶生成を Haiku 固定に（定型の3セクション要約のため軽量モデルで十分。本番会話は従来モデルのまま）。init_greeting_stream の呼び出しモデルを haiku に固定。
 ## 次の候補
 （リモート接続ロードマップ。ステップ①HOST可変化・同一WiFi疎通は「LAN接続をデフォルト化」等で完了済み。②トークン認証も完了。本命の接続経路はTailscale、ポート開放/公開トンネルは非推奨）
 - [ ] Tailscale serve 経由アクセスのトークン認証（厳密案）。serve はTLS終端後に `127.0.0.1` からプロキシするため、現状 `_authenticate()` のloopback無条件許可でトークン認証がバイパスされる（＝tailnet参加端末なら誰でも到達可という割り切りで現在は運用）。より厳密にするなら、serve が付与するヘッダ（`Tailscale-User-Login` 等）の有無で「serveプロキシ経由リクエスト」を判定し、その場合はloopback免除を外してトークン（またはTailscaleユーザーID）を要求する。`app/server.py` の `_client_is_loopback()`／`_authenticate()` 周辺。
 - [ ]（任意）ネイティブAndroid化＋プッシュ通知（後回しでよい）
 
 ## 完了
+- [x] 開始時確認メッセージ（挨拶生成）のオーバーヘッド削減。案A: `read_tasks` が TASKS.md の `## 完了` 見出し以降を切り落とし、挨拶プロンプトへ注入するトークンを削減。案B: `init_greeting_stream` の挨拶生成モデルをクライアント選択に依らず Sonnet 固定に（定型の3セクション要約用に軽量化。本番会話は従来どおりユーザー選択モデル）。`app/server.py` の read_tasks / init_greeting_stream 周辺。APP_VERSION 0.8.7→0.8.8
 - [x] 記憶マーカー誤検出によるAI返信途切れの修正。原因: 記憶マーカー（`[[TODOCHAT_MEMORY]]`）の判定が「本文中の最初の出現」を無条件にブロック開始と誤認し、以降を丸ごとカットしていた（サーバ側 `MEMORY_RE` ＋クライアント側 `stripMemory` の両方）。そのため、マーカーの書き方を例示・説明する返信（行頭以外での言及）まで途中で切れてしまう不具合があった。対処: 両者を行頭アンカー化（server: `re.MULTILINE` 付き `^[ \t]*`、client: `/^[ \t]*.../m`）して、行頭で始まる場合のみ実際の記憶ブロックとして扱うよう厳密化。加えて streamedTurn の最終描画を `final.reply`（サーバで既に除去済みの完全なテキスト）に統一し、分割（segmented）時は除外するよう修正。実サーバー（稼働中プロセス）へ `/api/chat` で「マーカーを本文中に例示する返信」を実投げしてE2E確認済み（返信が途切れず完全な形で返ることを確認）。APP_VERSION 0.8.9→0.8.10
 - [x] 終了時記憶保存のオーバーヘッド削減（案D/E: 論理時刻クロックで鮮度管理）。会話ごとに `LAST_USER_TURN`/`LAST_MEMORY_SAVE` を論理時刻でトラッキングし、`apply_memory_block`／`write_memory`／`remember_stream`／`snapshot_memory_blocking` の各保存経路で `mark_memory_saved`、ユーザー発話開始時に `mark_user_turn` を呼ぶ。`finalize_memory_if_enabled` は `memory_is_fresh`（最後の記憶保存が最後のユーザー発話以降）がTrueなら `snapshot_memory_blocking` を呼ばず即終了し、ターン内 `TODOCHAT_MEMORY` 保存との重複や終了ボタンの待ち（最大120秒）を回避。実機確認済み。APP_VERSION 0.8.8→0.8.9
 - [x] PWA全画面化の実機最終確認（案A: Tailscale serve でHTTPS配信）。Tailscale管理コンソールで「HTTPS Certificates」を有効化のうえ、⚙️設定の「🔒 全画面PWA用（Tailscale HTTPS）」に出る `https://desktop-41gnrgo.tail0a7381.ts.net/` をAndroidで開き、ホーム画面追加が全画面（standalone）表示になることを実機で確認済み。
