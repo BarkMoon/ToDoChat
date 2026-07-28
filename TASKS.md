@@ -2,7 +2,11 @@
 
 ## 進行中
 - [ ] コンテキスト使用量バーの改善（詳細は着手時に説明）。
-- [ ] 終了時記憶保存時のオーバーヘッドの削減（詳細は着手時に説明）。
+- [ ] 開始時確認メッセージのオーバーヘッド削減。
+  - 案A: 挨拶プロンプトへの TASKS.md 注入から `## 完了` セクションを除外（read_tasks を進行中・次の候補までで打ち切り、巨大な完了リストのトークンを削減）。app/server.py の read_tasks / init_greeting_stream 周辺。
+  - 案B: 挨拶生成を Haiku 固定に（定型の3セクション要約のため軽量モデルで十分。本番会話は従来モデルのまま）。init_greeting_stream の呼び出しモデルを haiku に固定。
+- [ ] 終了時記憶保存のオーバーヘッド削減。
+  - 案D/E（一体実装）: 論理時刻カウンタで会話の鮮度を管理し、終了時スナップショットが不要なら丸ごとスキップ。apply_memory_block 成功時に LAST_MEMORY_SAVE を、ユーザー発話時に LAST_USER_TURN を更新し、finalize_memory_if_enabled 冒頭で「最後の記憶保存以降に新規ユーザー発話が無ければ snapshot_memory_blocking を呼ばず即終了」と判定。ターン内 TODOCHAT_MEMORY 保存と終了時保存の重複を排除し、終了ボタンの待ち（最大120秒）をほぼ消す。app/server.py の finalize_memory_if_enabled / snapshot_memory_blocking / apply_memory_block 周辺。
 
 ## 次の候補
 （リモート接続ロードマップ。ステップ①HOST可変化・同一WiFi疎通は「LAN接続をデフォルト化」等で完了済み。②トークン認証も完了。本命の接続経路はTailscale、ポート開放/公開トンネルは非推奨）

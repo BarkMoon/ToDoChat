@@ -32,7 +32,7 @@ from safe_shell import is_safe_command, is_safe_powershell   # read-only-command
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.7"
+APP_VERSION = "0.8.8"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -1402,10 +1402,20 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib
 
 
 def read_tasks(d):
+    """TASKS.md を挨拶プロンプト用に読む。起動時の第一声に必要なのは進行中・
+    次の候補だけで、`## 完了` 以下の巨大な履歴は要らないため、最初に現れる
+    完了見出し以降を切り落として注入トークンを削減する（案A）。完了見出しが
+    無ければ全文を返す。"""
     try:
-        return (Path(d) / "TASKS.md").read_text(encoding="utf-8")
+        text = (Path(d) / "TASKS.md").read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
         return "(このフォルダに TASKS.md はありません)"
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.match(r"^#{1,6}\s*完了\b", line.strip()):
+            trimmed = "\n".join(lines[:i]).rstrip()
+            return trimmed + "\n\n(以降の「完了」履歴は起動時要約のため省略)"
+    return text
 
 
 # Light continuation prompt used only in full-log restore mode: the whole prior
@@ -1430,6 +1440,12 @@ def init_greeting_stream(model=None, mode=None):
     if not os.path.isdir(proj):
         yield {"type": "final", "ok": False, "error": f"作業フォルダが存在しません: {proj}"}
         return
+
+    # 案B: 起動時の第一声は定型の3セクション要約なので、クライアントが選んだ
+    # モデルに関わらず Sonnet 固定で生成する（Haiku では挨拶内容が不十分なため
+    # Sonnet に引き上げ。Opus よりは軽量でレイテンシ・コストを抑える）。
+    # 本番の会話ターンは従来どおりユーザー選択モデルのまま。
+    model = "sonnet"
 
     # Full-log restore (opt-in, default OFF): if the toggle is on AND we have a
     # saved session_id for this folder, resume the whole conversation instead of
