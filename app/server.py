@@ -32,7 +32,7 @@ from safe_shell import is_safe_command, is_safe_powershell   # read-only-command
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.8"
+APP_VERSION = "0.8.9"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -313,6 +313,47 @@ MEMORY_DIR = APP_HOME / ".todochat" / "memory"   # active notes (server-managed,
 TRASH_DIR = APP_HOME / ".todochat" / "trash"     # backups of deleted/overwritten notes
 MEMORY_RE = re.compile(r"\[\[TODOCHAT_MEMORY\]\](.*?)\[\[/TODOCHAT_MEMORY\]\]", re.DOTALL)
 
+# --- memory-freshness clock (skip redundant close-time snapshots) ------------
+# A monotonic logical clock lets us tell, per project, whether anything worth
+# re-summarizing happened since the last time the memory note was saved. Each
+# real user turn ticks the clock into LAST_USER_TURN; each successful memory
+# save ticks it into LAST_MEMORY_SAVE. At shutdown, if the note was saved at or
+# after the most recent user turn (LAST_MEMORY_SAVE >= LAST_USER_TURN > 0), the
+# note already reflects the conversation, so the blocking close-time snapshot --
+# which spawns the CLI and can make the 終了 button wait up to ~120s -- is
+# skipped entirely. This removes the common double-save where a turn already
+# emitted a [[TODOCHAT_MEMORY]] block and the close snapshot would redo it.
+_MEMORY_CLOCK = 0
+_MEMORY_CLOCK_LOCK = threading.Lock()
+LAST_USER_TURN = {}    # norm(project_path) -> clock tick of the last real user turn
+LAST_MEMORY_SAVE = {}  # norm(project_path) -> clock tick of the last saved note
+
+
+def _next_clock():
+    global _MEMORY_CLOCK
+    with _MEMORY_CLOCK_LOCK:
+        _MEMORY_CLOCK += 1
+        return _MEMORY_CLOCK
+
+
+def mark_user_turn(proj):
+    """Record that a real user message just started a turn for this project."""
+    LAST_USER_TURN[norm(proj)] = _next_clock()
+
+
+def mark_memory_saved(proj):
+    """Record that the memory note for this project was just (re)saved."""
+    LAST_MEMORY_SAVE[norm(proj)] = _next_clock()
+
+
+def memory_is_fresh(proj):
+    """True iff the note was saved at or after the most recent user turn (and a
+    save has actually happened), i.e. nothing new to summarize since. Used to
+    skip the redundant close-time snapshot."""
+    n = norm(proj)
+    saved = LAST_MEMORY_SAVE.get(n, 0)
+    return saved > 0 and saved >= LAST_USER_TURN.get(n, 0)
+
 # --- contributor memo (which models did the uncommitted work) ---------------
 # A tiny per-project list of the model display-names that DID implementation work
 # (design or an actual file edit) since the last commit. It is auto-appended when
@@ -387,6 +428,11 @@ def apply_memory_block(proj, reply_text):
             memory_path(proj).write_text(new, encoding="utf-8")
         except OSError:
             pass
+    if new:
+        # A non-empty block (even if identical to the stored note) means the AI
+        # produced an up-to-date summary this turn -> the note is fresh, so the
+        # close-time snapshot can be skipped.
+        mark_memory_saved(proj)
     return MEMORY_RE.sub("", reply_text).strip(), bool(new)
 
 
@@ -435,6 +481,7 @@ def write_memory(proj, text):
         if text:
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)
             p.write_text(text, encoding="utf-8")
+            mark_memory_saved(proj)   # hand-edited note is current -> skip close snapshot
         elif p.exists():
             p.unlink()
     except OSError as e:
@@ -619,6 +666,7 @@ def remember_stream(model=None):
                 try:
                     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
                     memory_path(proj).write_text(reply, encoding="utf-8")
+                    mark_memory_saved(proj)
                     saved = True
                 except OSError:
                     pass
@@ -667,6 +715,7 @@ def snapshot_memory_blocking(proj, timeout=120):
             backup_memory(proj)
             MEMORY_DIR.mkdir(parents=True, exist_ok=True)
             memory_path(proj).write_text(reply.strip(), encoding="utf-8")
+            mark_memory_saved(proj)
             had = True
         except OSError:
             pass
@@ -678,8 +727,14 @@ def finalize_memory_if_enabled():
     shutdown path (the 終了 button and a window close), never on a reload."""
     if not CONFIG.get("auto_remember"):
         return False
+    proj = CONFIG["current"]
+    # 案D/E: if the note was already (re)saved at or after the last user turn,
+    # it reflects the current conversation -> skip the blocking CLI snapshot so
+    # the 終了 button doesn't wait. Report True since a fresh note exists.
+    if memory_is_fresh(proj):
+        return True
     try:
-        return snapshot_memory_blocking(CONFIG["current"])
+        return snapshot_memory_blocking(proj)
     except Exception:
         return False
 
@@ -1743,6 +1798,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "メッセージが空です。"})
                 return
             proj = CONFIG["current"]
+            mark_user_turn(proj)   # tick the freshness clock: new user input to summarize
             self._stream_ndjson(recording_stream(
                 proj,
                 run_claude_stream(msg, resume=True, model=body.get("model"),
