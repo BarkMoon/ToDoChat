@@ -118,6 +118,9 @@
     font-size: 12px; color: var(--muted);
   }
   #tokstrip .lbl { color: var(--muted); }
+  .tk-sel { background: var(--code); color: var(--text); border: 1px solid var(--border);
+            border-radius: 6px; padding: 3px 6px; font-size: 12px; cursor: pointer; }
+  .tk-reset { color: var(--muted); font-family: Consolas, "Courier New", monospace; }
   .tk-bar { flex: 1; min-width: 140px; max-width: 360px; height: 12px;
             background: var(--code); border: 1px solid var(--border); border-radius: 999px; overflow: hidden; }
   .tk-fill { height: 100%; width: 0%; background: #3fb950; border-radius: 999px; transition: width .35s ease, background .35s ease; }
@@ -287,9 +290,15 @@
   </header>
 
   <div id="tokstrip">
-    <span class="lbl">コンテキスト使用量</span>
+    <select class="tk-sel" id="barSel" title="バーに表示する使用量の種類を切り替えます">
+      <option value="session">5時間枠</option>
+      <option value="weekly">週次</option>
+      <option value="credit">追加クレジット</option>
+      <option value="ctx">文脈メモリ</option>
+    </select>
     <div class="tk-bar"><div class="tk-fill" id="ctxFill"></div></div>
     <span class="tk-pct" id="ctxPct">—</span>
+    <span class="tk-reset" id="ctxReset"></span>
     <span class="tk-cum" id="cumTxt" title="このセッションの累計トークン使用量">累計 —</span>
   </div>
 
@@ -528,20 +537,89 @@ async function toggleStartup(){
 startupBtn.addEventListener('click', toggleStartup);
 startupState.textContent = '…';
 
-// ---- token usage ----
+// ---- usage strip ----
+// One bar, several metrics. The dropdown (#barSel) chooses which to show:
+//   session/weekly/credit = プラン利用枠（サーバー /api/usage が Claude の
+//   「設定＞使用量」を取得）, ctx = この会話の文脈の埋まり具合（従来のバー）。
 const totals = { prompt: 0, out: 0, cacheR: 0, cacheC: 0, cost: 0 };
+let planUsage = null;   // 最新の /api/usage 結果 {ok, session, weekly, credit}
+let lastCtx = null;     // 直近ターンの文脈使用量 {pct, prompt, ctx}
+const barSel = document.getElementById('barSel');
+barSel.value = localStorage.getItem('barSel') || 'session';
+barSel.addEventListener('change', () => { localStorage.setItem('barSel', barSel.value); renderBar(); });
+
 function fmt(n){ return n >= 1000 ? (n/1000).toFixed(1)+'k' : String(n); }
 function barColor(pct){ return pct < 50 ? '#3fb950' : (pct < 80 ? '#d29922' : '#f85149'); }
+// プラン枠の色は severity 優先（無ければ%閾値）。
+function sevColor(sev, pct){
+  if (sev === 'warning' || sev === 'warn') return '#d29922';
+  if (['reached','rejected','blocked','exceeded','critical'].includes(sev)) return '#f85149';
+  return barColor(pct);
+}
+function fmtReset(iso){
+  if (!iso) return '';
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return '';
+  let s = Math.max(0, Math.floor((t - Date.now()) / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  if (h >= 24) return `あと約${Math.floor(h / 24)}日${h % 24}時間でリセット`;
+  if (h >= 1)  return `あと${h}時間${m}分でリセット`;
+  return `あと${m}分でリセット`;
+}
+
+function renderBar(){
+  const mode = barSel.value;
+  const fill = document.getElementById('ctxFill');
+  const pctEl = document.getElementById('ctxPct');
+  const resetEl = document.getElementById('ctxReset');
+  let pct = 0, color = '#3fb950', label = '—', reset = '';
+  if (mode === 'ctx'){
+    if (lastCtx){
+      pct = lastCtx.pct; color = barColor(pct);
+      label = `${pct.toFixed(1)}%  (${fmt(lastCtx.prompt)} / ${fmt(lastCtx.ctx)})`;
+    }
+  } else if (planUsage && planUsage.ok){
+    if (mode === 'credit'){
+      const c = planUsage.credit || {};
+      pct = c.pct || 0; color = sevColor(c.severity, pct);
+      label = `$${(c.used||0).toFixed(2)} / $${(c.limit||0).toFixed(2)}（残 $${(c.remaining||0).toFixed(2)}）`;
+    } else {
+      const w = planUsage[mode] || {};
+      pct = w.pct || 0; color = sevColor(w.severity, pct);
+      label = `${pct}%`;
+      reset = fmtReset(w.resets_at);
+    }
+  } else {
+    label = '取得できません';   // /api/usage 失敗時（非公式APIのため寛容に）
+  }
+  fill.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + '%';
+  fill.style.background = color;
+  pctEl.textContent = label;
+  resetEl.textContent = reset ? '・' + reset : '';
+}
+
+// プラン利用枠を /api/usage から取得。失敗しても前回値を保持し黙って続行。
+async function fetchUsage(force){
+  try {
+    const r = await api('/api/usage' + (force ? '?force=1' : ''), null, 'GET');
+    if (r && r.ok) planUsage = r;
+    // クレジット無効時は選択肢自体を隠し、選択中なら5時間枠へ退避。
+    const opt = barSel.querySelector('option[value="credit"]');
+    const enabled = !!(r && r.ok && r.credit && r.credit.enabled);
+    if (opt) opt.hidden = !enabled;
+    if (!enabled && barSel.value === 'credit'){
+      barSel.value = 'session'; localStorage.setItem('barSel', 'session');
+    }
+  } catch (_) { /* 取得失敗は無視（前回値のまま） */ }
+  renderBar();
+}
+
 function addUsage(u){
   if (!u) return;
-  // context bar = this turn's prompt tokens / model context window
+  // 文脈バー = 今ターンのプロンプトトークン / モデルのコンテキスト枠。
   const ctx = u.context_window || 200000;
   const pct = Math.max(0, Math.min(100, (u.prompt_tokens || 0) / ctx * 100));
-  const fill = document.getElementById('ctxFill');
-  fill.style.width = pct.toFixed(1) + '%';
-  fill.style.background = barColor(pct);
-  document.getElementById('ctxPct').textContent =
-    `${pct.toFixed(1)}%  (${fmt(u.prompt_tokens||0)} / ${fmt(ctx)})`;
+  lastCtx = { pct, prompt: u.prompt_tokens || 0, ctx };
 
   // cumulative session totals
   totals.prompt += u.prompt_tokens || 0;
@@ -556,13 +634,14 @@ function addUsage(u){
     `　入力(プロンプト計): ${totals.prompt.toLocaleString()}\n` +
     `　出力: ${totals.out.toLocaleString()}\n` +
     `　うちキャッシュ読取: ${totals.cacheR.toLocaleString()} / 書込: ${totals.cacheC.toLocaleString()}\n` +
-    `　推定コスト: $${totals.cost.toFixed(4)}（Proサブスクでは実課金なし・目安）\n` +
-    `※Proプランの「残トークン量」はCLIから取得できないため表示できません`;
+    `　推定コスト: $${totals.cost.toFixed(4)}（Proサブスクでは実課金なし・目安）`;
+
+  renderBar();
+  fetchUsage(true);   // ターン消費を反映するためプラン枠を取り直す（fire-and-forget）
 }
 function resetContextBar(){
-  const fill = document.getElementById('ctxFill');
-  fill.style.width = '0%'; fill.style.background = '#3fb950';
-  document.getElementById('ctxPct').textContent = '—';
+  lastCtx = null;
+  renderBar();
 }
 
 // ---- minimal, XSS-safe markdown renderer ----
@@ -1545,7 +1624,7 @@ document.getElementById('quitBtn').addEventListener('click', async () => {
     + 'ToDoChatを終了しました。<br>サーバーは停止済みです。このウィンドウを閉じて構いません。</div>';
 });
 
-(async () => { await loadProjects(); loadStartupStatus(); await init(); })();
+(async () => { await loadProjects(); loadStartupStatus(); fetchUsage(false); await init(); })();
 
 // PWA: サービスワーカーを登録(ホーム画面追加・オフライン起動のため)。
 if ('serviceWorker' in navigator) {

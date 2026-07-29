@@ -22,6 +22,7 @@ import traceback
 import uuid
 import webbrowser
 import secrets
+import urllib.request
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,7 +33,7 @@ from safe_shell import is_safe_command, is_safe_powershell   # read-only-command
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.10"
+APP_VERSION = "0.8.11"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -1305,6 +1306,108 @@ def extract_usage(data):
     }
 
 
+# --- plan usage (Claude の「設定＞使用量」) ----------------------------------
+# The headless CLI exposes no usage command, but the OAuth token it stores can
+# query the same endpoint that powers the in-app 使用量 screen. This is an
+# UNOFFICIAL endpoint (may change with a CLI/account update), so every caller
+# must tolerate failure -- the UI then just keeps the last good value / hides the
+# affected bar. Cached briefly so per-turn polling doesn't hammer it.
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CRED_FILE = Path(os.environ.get("USERPROFILE", "")) / ".claude" / ".credentials.json"
+_USAGE_TTL = 20   # seconds
+_usage_cache = {"at": 0.0, "data": None}
+
+
+def _oauth_token():
+    """Read the Claude subscription OAuth access token the CLI keeps refreshed."""
+    try:
+        d = json.loads(CRED_FILE.read_text(encoding="utf-8"))
+        return ((d.get("claudeAiOauth") or {}).get("accessToken") or "").strip()
+    except Exception:
+        return ""
+
+
+def _usage_pct(x):
+    try:
+        return max(0, min(100, round(float(x))))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _money(v):
+    """amount_minor + exponent (e.g. 938, 2) -> float in currency units (9.38)."""
+    try:
+        return (v.get("amount_minor", 0) or 0) / (10 ** (v.get("exponent", 2) or 2))
+    except Exception:
+        return 0.0
+
+
+def _normalize_usage(raw):
+    """Shape the endpoint payload into the three bars the UI selects between:
+    5時間枠 (session) / 週次 (weekly) / 追加クレジット (credit)."""
+    limits = {l.get("kind"): l for l in (raw.get("limits") or []) if isinstance(l, dict)}
+
+    def window(kind, fallback_key):
+        l = limits.get(kind)
+        if l:
+            return {"pct": _usage_pct(l.get("percent")),
+                    "severity": l.get("severity") or "normal",
+                    "resets_at": l.get("resets_at")}
+        fb = raw.get(fallback_key) or {}
+        return {"pct": _usage_pct(fb.get("utilization")),
+                "severity": "normal",
+                "resets_at": fb.get("resets_at")}
+
+    sp = raw.get("spend") or {}
+    eu = raw.get("extra_usage") or {}
+    enabled = sp.get("enabled")
+    if enabled is None:
+        enabled = eu.get("is_enabled")
+    used = _money(sp.get("used") or {})
+    limit = _money(sp.get("limit") or {})
+    credit = {
+        "enabled": bool(enabled),
+        "used": round(used, 2),
+        "limit": round(limit, 2),
+        "remaining": round(max(0.0, limit - used), 2),
+        "pct": _usage_pct(sp.get("percent")),
+        "severity": sp.get("severity") or "normal",
+        "currency": (sp.get("used") or {}).get("currency") or eu.get("currency") or "USD",
+    }
+    return {"ok": True,
+            "session": window("session", "five_hour"),
+            "weekly": window("weekly_all", "seven_day"),
+            "credit": credit}
+
+
+def fetch_plan_usage(force=False):
+    """Return {ok, session, weekly, credit} for the usage strip, else {ok:False}.
+    Cached for _USAGE_TTL seconds; failures are soft (unofficial endpoint)."""
+    now = time.time()
+    cached = _usage_cache["data"]
+    if not force and cached and cached.get("ok") and now - _usage_cache["at"] < _USAGE_TTL:
+        return cached
+    tok = _oauth_token()
+    if not tok:
+        return {"ok": False, "error": "no_token"}
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + tok,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Accept": "application/json",
+        "User-Agent": "todochat-usage",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = json.loads(r.read().decode("utf-8", "replace"))
+        out = _normalize_usage(raw)
+    except Exception as e:
+        # Keep the last good reading visible rather than blanking the bar.
+        return cached or {"ok": False, "error": type(e).__name__}
+    _usage_cache["data"] = out
+    _usage_cache["at"] = now
+    return out
+
+
 def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib=False):
     """Generator yielding, as the reply is produced:
         {"type":"delta","text":...}                       streamed reply text
@@ -1765,6 +1868,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/startup/status":
             self._send_json(get_startup_status())
+            return
+        if self.path.startswith("/api/usage"):
+            q = parse_qs(urlparse(self.path).query)
+            self._send_json(fetch_plan_usage(force=("force" in q)))
             return
         if self.path in ("/", "/index.html"):
             try:
