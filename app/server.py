@@ -30,10 +30,20 @@ from urllib.parse import urlparse, parse_qs
 
 from safe_shell import is_safe_command, is_safe_powershell   # read-only-command allowlists (auto-approve)
 
+# On Japanese Windows the console / redirected stdout defaults to cp932, which
+# can't encode the emoji in our startup messages -> UnicodeEncodeError would
+# crash the server before serve_forever ever runs. Force UTF-8 (with replacement)
+# so logging never aborts startup, regardless of console codepage or redirection.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.8.11"
+APP_VERSION = "0.8.12"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
