@@ -2,8 +2,11 @@
 
 ## 次の候補
 （リモート接続ロードマップ。ステップ①HOST可変化・同一WiFi疎通は「LAN接続をデフォルト化」等で完了済み。②トークン認証も完了。本命の接続経路はTailscale、ポート開放/公開トンネルは非推奨）
-- [ ] Tailscale serve 経由アクセスのトークン認証（厳密案）。serve はTLS終端後に `127.0.0.1` からプロキシするため、現状 `_authenticate()` のloopback無条件許可でトークン認証がバイパスされる（＝tailnet参加端末なら誰でも到達可という割り切りで現在は運用）。より厳密にするなら、serve が付与するヘッダ（`Tailscale-User-Login` 等）の有無で「serveプロキシ経由リクエスト」を判定し、その場合はloopback免除を外してトークン（またはTailscaleユーザーID）を要求する。`app/server.py` の `_client_is_loopback()`／`_authenticate()` 周辺。
+- （現在なし。保留欄を参照）
+
+## 保留
 - [ ]（任意）ネイティブAndroid化＋プッシュ通知（後回しでよい）
+- [ ] Tailscale serve 経由アクセスのトークン認証（厳密案）。serve はTLS終端後に `127.0.0.1` からプロキシするため、現状 `_authenticate()` のloopback無条件許可でトークン認証がバイパスされる（＝tailnet参加端末なら誰でも到達可という割り切りで現在は運用）。より厳密にするなら、serve が付与するヘッダ（`Tailscale-User-Login` 等）の有無で「serveプロキシ経由リクエスト」を判定し、その場合はloopback免除を外してトークン（またはTailscaleユーザーID）を要求する。`app/server.py` の `_client_is_loopback()`／`_authenticate()` 周辺。※厳密化するとPWA全画面インストールで初回QR認証の手間が復活する（AndroidはCookie共有で初回1回のみ／iOSはSafariとPWAで保存領域が分離のためPWA内で個別認証が必要）トレードオフあり。信頼できる相手のみのtailnet運用なら実害薄く後回し可。
 
 ## 完了
 - [x] 起動時のUnicodeEncodeErrorクラッシュ修正（日本語Windowsのcp932対策）。日本語Windowsではコンソール／リダイレクト先のstdoutが既定でcp932となり、起動メッセージや⚙️絵文字（LANモードのトークン案内行等）をエンコードできず `serve_forever` 到達前に `UnicodeEncodeError` でクラッシュしていた。対処: `app/server.py` 冒頭で `sys.stdout`/`sys.stderr` を `reconfigure(encoding="utf-8", errors="replace")` で起動直後にUTF-8化（`AttributeError`/`ValueError`/`OSError` 時は握り潰し）。cp932再現環境（`io.TextIOWrapper(encoding="cp932")`）でreconfigureがcp932→utf-8に成功し、LANモードの⚙️行プリントがクラッシュせず⚙が出力に含まれることを検証済み（対照実験として生cp932ストリームへの⚙書込みは従来通りクラッシュ＝修正が防ぐ事象を裏付け）。APP_VERSION 0.8.11→0.8.12
