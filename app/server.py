@@ -43,7 +43,7 @@ for _stream in (sys.stdout, sys.stderr):
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -963,13 +963,13 @@ def version_string():
     try:
         head = subprocess.run(
             ["git", "-C", str(APP_HOME), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=3)
+            capture_output=True, encoding="utf-8", errors="replace", timeout=3)
         if head.returncode != 0:
             return APP_VERSION
         commit = head.stdout.strip()
         dirty = subprocess.run(
             ["git", "-C", str(APP_HOME), "status", "--porcelain"],
-            capture_output=True, text=True, timeout=3)
+            capture_output=True, encoding="utf-8", errors="replace", timeout=3)
         mark = "+" if dirty.stdout.strip() else ""
         return f"{APP_VERSION} ({commit}{mark})"
     except (OSError, subprocess.TimeoutExpired):
@@ -1064,7 +1064,7 @@ def _schtasks(args):
     Used for the read-only /query (which standard users are allowed to do)."""
     try:
         r = subprocess.run(["schtasks.exe", *args], capture_output=True,
-                            text=True, timeout=10)
+                            text=True, errors="replace", timeout=10)
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
         return 1, "", "schtasks.exe が見つかりません（Windows専用機能です）。"
@@ -1096,7 +1096,7 @@ def _schtasks_elevated(argstr):
     try:
         r = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, errors="replace", timeout=120)
         return r.returncode
     except FileNotFoundError:
         return -1
@@ -2125,7 +2125,7 @@ def _tailscale_ip():
     for exe in _TS_EXES:
         try:
             r = subprocess.run([exe, "ip", "-4"], capture_output=True,
-                               text=True, timeout=3)
+                               encoding="utf-8", errors="replace", timeout=3)
         except (OSError, subprocess.TimeoutExpired):
             continue  # not this path (or hung) -- try the next candidate
         for line in r.stdout.splitlines():
