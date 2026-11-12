@@ -349,7 +349,7 @@
       <div class="modal-desc">
         <b id="modelsProj">—</b> で<b>設計・実装（ファイル編集）を行ったモデル</b>の記録です。
         <b>git commit 時にコミットメッセージへ自動で反映</b>され、コミット後にクリアされます。
-        1行に1モデルで自由に編集できます（例: <code>Opus 4.8</code>）。<b>空にして保存すると削除</b>されます。
+        1行に1モデルで自由に編集できます（例: <code id="modelsExample">Opus 4.8</code>）。<b>空にして保存すると削除</b>されます。
       </div>
       <textarea id="modelsText" placeholder="（このフォルダの使用モデル記録はまだありません）" spellcheck="false"></textarea>
       <div class="modal-actions">
@@ -833,6 +833,8 @@ async function loadProjects(){
       projSel.appendChild(o);
     });
     if (data.version) document.getElementById('ver').textContent = 'v' + data.version;
+    modelVersions = data.model_versions || {};   // real AI versions (auto-detected)
+    renderModelVersions();
     autoRemember = !!data.auto_remember;   // restore last-saved toggle state
     renderAutoRemember();
     fullLog = !!data.full_log;             // restore last-saved full-log choice
@@ -895,6 +897,21 @@ document.getElementById('delProj').addEventListener('click', async () => {
 // ---- init / send ----
 const modelSel = document.getElementById('model');
 
+// Real per-model version labels (e.g. {opus:'Opus 5.5'}), learned server-side at
+// zero token cost from the model IDs the CLI reports -- so a family upgrade shows
+// here automatically, no manual "update" needed. Filled by loadProjects().
+let modelVersions = {};
+function renderModelVersions(){
+  const roles = { opus: '高性能', sonnet: 'バランス', haiku: '高速' };
+  [...modelSel.options].forEach(o => {
+    const label = modelVersions[o.value] || o.value;
+    const role = roles[o.value];
+    o.textContent = role ? `${label}（${role}）` : label;
+  });
+  const ex = document.getElementById('modelsExample');
+  if (ex && modelVersions.opus) ex.textContent = modelVersions.opus;
+}
+
 // Drives one streamed request. The reply can arrive in multiple text segments
 // separated by approval cards (confirm mode): each segment grows live as plain
 // text, then settles into rendered Markdown when the segment ends (a permission
@@ -908,6 +925,34 @@ const modelSel = document.getElementById('model');
 // (e.g. the AI explaining this feature in prose or `code`) must not truncate the
 // shown reply. Mirrors the server's line-anchored MEMORY_RE.
 function stripMemory(s){ const m = /^[ \t]*\[\[TODOCHAT_MEMORY\]\]/m.exec(s); return m ? s.slice(0, m.index).replace(/\s+$/, '') : s; }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// A streamed turn's connection dropped (the usual cause: a phone backgrounded the
+// app, or a flaky mobile network). The server keeps the turn running and records
+// its reply to the transcript, so instead of losing the exchange we wait for the
+// reply to land and re-render the conversation from the authoritative transcript.
+// Returns true once restored; false if the server is unreachable (a real failure
+// the caller should surface) or nothing landed in time.
+async function recoverConversation(){
+  const waiting = bubble('接続が切れました。応答の完成を待っています… （ホームに戻っても続行します）', 'sys');
+  for (let i = 0; i < 40; i++){
+    let turns;
+    try {
+      const r = await api('/api/transcript/get', {});
+      turns = (r && r.turns) || [];
+    } catch (_){ waiting.remove(); return false; }   // server truly gone -> real error
+    // The server records the user turn up front and the AI reply when the turn
+    // ends; once the last entry is an AI turn, the reply has landed.
+    if (turns.length && turns[turns.length - 1].role === 'ai'){
+      log.innerHTML = ''; resetContextBar();
+      turns.forEach(t => bubble(t.text, t.role === 'user' ? 'user' : 'ai'));
+      bubble('接続が復帰し、最新の会話を再読み込みしました。この続きから入力できます。', 'sys');
+      return true;
+    }
+    await sleep(1500);
+  }
+  waiting.remove();
+  return false;
+}
 async function streamedTurn(path, payload, onFail){
   let live = null, liveIsText = false, liveText = '', final = null;
   // A permission card or mid-stream notice splits the reply across several
@@ -952,7 +997,14 @@ async function streamedTurn(path, payload, onFail){
       }
     });
   } catch (e){
-    finalizeLive(); onFail('通信エラー: ' + e); return null;
+    finalizeLive();
+    // Stream dropped before the server reported a result. The turn keeps running
+    // server-side and its reply is recorded, so recover the completed exchange
+    // from the transcript rather than losing it; only surface the raw error if the
+    // server is genuinely unreachable.
+    const recovered = await recoverConversation();
+    if (!recovered) onFail('通信エラー: ' + e);
+    return null;
   }
   // Prefer the server's authoritative, memory-stripped reply for the final
   // render. Streamed deltas can drop a chunk (a rarely mis-parsed stream line)
@@ -1607,6 +1659,12 @@ window.addEventListener('beforeunload', beaconShutdown);
 function heartbeat(){ api('/api/alive', {}).catch(() => {}); }
 heartbeat();                                     // cancels a reload-armed shutdown
 setInterval(heartbeat, 4000);
+// Returning to the foreground (phone un-backgrounded): the heartbeat timer was
+// throttled/paused while hidden, so beat immediately to re-assert that the page is
+// alive. (Any in-flight recoverConversation also resumes now that timers run again.)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') heartbeat();
+});
 
 document.getElementById('quitBtn').addEventListener('click', async () => {
   if (!confirm('ToDoChatを終了しますか？\nサーバーを停止し、ウィンドウを閉じます。')) return;

@@ -43,7 +43,7 @@ for _stream in (sys.stdout, sys.stderr):
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "0.9.1"
+APP_VERSION = "1.0.0"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -144,7 +144,75 @@ DEFAULT_MODEL = "sonnet"
 # Human-readable version names for the "which model did this work" memo, so a
 # commit message can credit the actual model (see the contributor-memo section).
 # Keyed by the same alias the UI sends. Kept next to MODELS so they stay in sync.
+# These are only FALLBACK labels: the real version in use is learned at zero token
+# cost from the model IDs the CLI reports on every turn (see MODEL_VERSIONS below),
+# so a model-family upgrade (e.g. Opus 4.8 -> 5.5) is picked up automatically.
 MODEL_DISPLAY = {"opus": "Opus 4.8", "sonnet": "Sonnet 5", "haiku": "Haiku 4.5"}
+
+# Learned, authoritative display names per alias, derived from the actual model ID
+# the CLI resolved each alias to (metadata already present in every turn's result,
+# so detecting it costs NO extra tokens). Persisted so a credit survives restarts.
+MODEL_VERSIONS_FILE = APP_HOME / ".todochat" / "model_versions.json"
+
+
+def _load_model_versions():
+    try:
+        d = json.loads(MODEL_VERSIONS_FILE.read_text(encoding="utf-8"))
+        if isinstance(d, dict):
+            return {k: v for k, v in d.items() if isinstance(v, str) and v}
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    return {}
+
+
+MODEL_VERSIONS = _load_model_versions()
+
+
+def _parse_model_display(model_id):
+    """Derive a human label from a CLI model ID at zero token cost.
+    'claude-opus-4-5-20250805' -> 'Opus 4.5'; 'claude-opus-5-5' -> 'Opus 5.5';
+    'claude-3-5-sonnet-20241022' -> 'Sonnet 3.5'. Returns None if the ID carries no
+    recognizable model family (so we never overwrite a good label with garbage)."""
+    if not model_id:
+        return None
+    mid = str(model_id).lower()
+    fam = next((f for f in ("opus", "sonnet", "haiku") if f in mid), None)
+    if not fam:
+        return None
+    # Version digits only: a run of 6+ digits is the YYYYMMDD date stamp, not a
+    # version component, so drop it.
+    nums = [n for n in re.findall(r"\d+", mid) if len(n) < 6]
+    disp = fam.capitalize()
+    if nums:
+        disp += " " + nums[0] + ("." + nums[1] if len(nums) > 1 else "")
+    return disp
+
+
+def model_display(alias):
+    """Best display name for an alias: the learned real version if we have one,
+    else the hardcoded fallback."""
+    return MODEL_VERSIONS.get(alias) or MODEL_DISPLAY.get(alias)
+
+
+def learn_model_version(alias, result_data):
+    """Update the learned display name for `alias` from a turn's result metadata.
+    The result's `modelUsage` is keyed by the concrete model IDs the CLI used; we
+    pick the one whose family matches the alias (the main model, not an auxiliary
+    like the title-gen haiku) and remember its parsed label. Zero token cost."""
+    if alias not in MODELS:
+        return
+    match = next((mid for mid in (result_data.get("modelUsage") or {})
+                  if alias in str(mid).lower()), None)
+    disp = _parse_model_display(match)
+    if not disp or MODEL_VERSIONS.get(alias) == disp:
+        return
+    MODEL_VERSIONS[alias] = disp
+    try:
+        MODEL_VERSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MODEL_VERSIONS_FILE.write_text(
+            json.dumps(MODEL_VERSIONS, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 # Tools whose use means the model actually edited files (as opposed to read-only
 # advice/verification). Only these turns get credited in the contributor memo.
 EDIT_TOOL_NAMES = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -548,8 +616,9 @@ def save_contributors(proj, models):
 
 def add_contributor(proj, model_key):
     """Credit a model (by UI alias) for editing files this turn. No-op for an
-    unknown alias or one already recorded."""
-    name = MODEL_DISPLAY.get(model_key)
+    unknown alias or one already recorded. Uses the real learned version when
+    known (so an upgraded family is credited correctly)."""
+    name = model_display(model_key)
     if not name:
         return
     cur = read_contributors(proj)
@@ -999,6 +1068,10 @@ def list_projects():
             # HTTPS URL via `tailscale serve` for full-screen PWA install (empty if
             # unavailable). No token: serve proxies from loopback, which is trusted.
             "tailscale_serve_url": tailscale_serve_url(),
+            # Real per-model version labels, learned at zero token cost from the
+            # model IDs the CLI reports (so a family upgrade shows up without any
+            # manual action). Falls back to the hardcoded label until first used.
+            "model_versions": {k: model_display(k) for k in MODELS},
             "version": version_string()}
 
 
@@ -1513,6 +1586,9 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib
 
     result_data = None
     did_edit = False   # did this turn actually issue a file-editing tool call?
+    reply_parts = []   # text of EVERY assistant message, in order, so a turn that
+                       # answers a question THEN does work keeps both (the CLI's
+                       # final `result` holds only the last message -- see below)
     try:
         while True:
             kind, payload = q.get()
@@ -1533,10 +1609,15 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib
                     if delta.get("type") == "text_delta" and delta.get("text"):
                         yield {"type": "delta", "text": delta["text"]}
             elif t == "assistant":
-                # Full assistant message: note if it edited files, to credit the
-                # model in the contributor memo (read-only turns issue no edits).
+                # Full assistant message: collect its text (to build the complete
+                # reply) and note if it edited files (to credit the model in the
+                # contributor memo; read-only turns issue no edits).
                 for block in ((d.get("message") or {}).get("content") or []):
-                    if (isinstance(block, dict) and block.get("type") == "tool_use"
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text" and block.get("text"):
+                        reply_parts.append(block["text"])
+                    elif (block.get("type") == "tool_use"
                             and block.get("name") in EDIT_TOOL_NAMES):
                         did_edit = True
             elif t == "result":
@@ -1563,9 +1644,16 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib
     new_sid = result_data.get("session_id")
     if new_sid:
         set_session(proj, new_sid)   # mirror to sessions.json for full-log restore
+    learn_model_version(model_key, result_data)   # refresh the real version label (free)
     if did_edit:
         add_contributor(proj, model_key)   # credit this model for the file changes
-    reply, had_memory = apply_memory_block(proj, result_data.get("result", ""))
+    # The CLI's `result` is only the LAST assistant message. When a turn answers a
+    # question and THEN does the work, that final-report message would otherwise be
+    # the whole reply and silently drop the earlier answer. Join every assistant
+    # message so nothing the user saw stream in is lost. Fall back to `result` if we
+    # somehow captured no assistant text (e.g. a parse hiccup).
+    full = "\n\n".join(p.strip() for p in reply_parts if p.strip())
+    reply, had_memory = apply_memory_block(proj, full or result_data.get("result", ""))
     usage = extract_usage(result_data)
     # Prefer our own detailed denial records (tool + command/path + reason, captured
     # by the guard hook) over the CLI's bare permission_denials, so the UI can show
@@ -1671,17 +1759,50 @@ def init_greeting_stream(model=None, mode=None):
     yield from run_claude_stream(prompt, resume=False, model=model, mode=mode)
 
 
+def _strip_partial_memory(text):
+    """Hide a (possibly unfinished) memory block from text we persist for a turn
+    that was cut off mid-stream. The real block is line-anchored (see MEMORY_RE),
+    so cut from a start marker at line-start onward; also drop any complete block."""
+    text = MEMORY_RE.sub("", text or "")
+    m = re.search(r"^[ \t]*\[\[TODOCHAT_MEMORY\]\]", text, re.MULTILINE)
+    return (text[:m.start()] if m else text).strip()
+
+
 def recording_stream(proj, gen, user_text=None):
     """Wrap a chat/init event generator so the visible conversation is mirrored
-    into the project's transcript (for the 🔄 cross-device sync). Records the
-    user's message up front and the AI's memory-stripped reply when the turn
-    finishes. Recording is best-effort and never interferes with the stream."""
+    into the project's transcript (so a refresh / another device / a dropped phone
+    connection can restore it). Records the user's message up front and the AI's
+    memory-stripped reply when the turn finishes. Crucially, if the turn is cut off
+    (token limit, network error, server-side error, or the client disconnecting),
+    we still persist whatever text streamed so far so a refresh never loses an
+    already-shown reply. Recording is best-effort and never interferes with the
+    stream."""
     if user_text:
         append_transcript(proj, "user", user_text)
-    for ev in gen:
-        if ev.get("type") == "final" and ev.get("ok"):
-            append_transcript(proj, "ai", ev.get("reply", ""))
-        yield ev
+    partial = []          # accumulated streamed text, in case the turn never lands
+    recorded = False      # did we already persist an AI turn for this run?
+    try:
+        for ev in gen:
+            kind = ev.get("type")
+            if kind == "delta":
+                partial.append(ev.get("text", ""))
+            elif kind == "final":
+                if ev.get("ok"):
+                    append_transcript(proj, "ai", ev.get("reply", ""))
+                else:
+                    # Interrupted turn: keep what was shown so refreshing the page
+                    # (the "更新ボタン") doesn't erase the in-progress exchange.
+                    append_transcript(proj, "ai", _strip_partial_memory("".join(partial)))
+                recorded = True
+            yield ev
+    finally:
+        # The consumer stopped iterating before any 'final' arrived -- almost always
+        # the client disconnected mid-stream (e.g. a phone backgrounded the app).
+        # Persist the partial so returning to the app restores it. (The underlying
+        # CLI run keeps going; if it later lands a full reply the next restore picks
+        # the longer transcript entry up on its own.)
+        if not recorded:
+            append_transcript(proj, "ai", _strip_partial_memory("".join(partial)))
 
 
 # --- HTTP handler -----------------------------------------------------------
@@ -1837,10 +1958,19 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
 
         try:
+            # If the client goes away mid-stream (a phone backgrounding the app is
+            # the common case), DON'T abandon the turn: stop writing but keep
+            # draining the generator so the CLI run finishes and its reply is
+            # recorded to the transcript. The user can then resume on return and
+            # restore the completed reply instead of losing it.
+            client_gone = False
             for ev in events:
-                write(ev)
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
-            pass  # client navigated away / closed the tab mid-stream
+                if client_gone:
+                    continue
+                try:
+                    write(ev)
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                    client_gone = True  # keep looping so the turn completes & records
         except Exception:
             tb = traceback.format_exc()
             log_error("stream error:\n" + tb)
@@ -2006,7 +2136,12 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/shutdown":
             # sendBeacon on window unload -> arm a graceful shutdown (a reload's
             # fresh /api/alive cancels it; a real close lets it proceed).
-            arm_shutdown()
+            # ONLY the local PC window (loopback) may do this. A phone fires the
+            # same beacon when it merely backgrounds the app; honoring that would
+            # kill the server mid-reply and drop the conversation, so remote
+            # clients can never shut the server down by switching away.
+            if self._client_is_loopback():
+                arm_shutdown()
             self._send_json({"ok": True})
         elif self.path == "/api/quit":
             # The 終了 button: optionally snapshot memory (blocks a few seconds
