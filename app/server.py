@@ -43,7 +43,7 @@ for _stream in (sys.stdout, sys.stderr):
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -899,10 +899,17 @@ def request_permission(run_id, tool, tool_input):
     # user sees WHAT the command does and WHY, not just the raw shell line. Only
     # needed here -- auto-approved safe commands don't get an explanation.
     desc = tool_input.get("description", "") if isinstance(tool_input, dict) else ""
-    run["queue"].put(("perm_request", {
+    payload = {
         "id": perm_id, "tool": tool, "command": command, "input": tool_input,
         "desc": desc,
-    }))
+    }
+    # Publish the request on the run so a client that reconnects after a dropped
+    # stream (a phone that backgrounded the app while this card was waiting) can
+    # fetch it via /api/pending and re-show the card -- the decision still routes
+    # back here via /api/permission-response (keyed by perm_id), so the paused work
+    # resumes. Cleared once answered.
+    run["pending_perm"] = payload
+    run["queue"].put(("perm_request", payload))
     # Wait for the user's decision with NO hard deadline. Confirm mode exists so a
     # human can take their time (they may be away from the machine), so we never
     # auto-deny on a timer. We only stop waiting if the run is torn down or its CLI
@@ -920,6 +927,7 @@ def request_permission(run_id, tool, tool_input):
             if RUNS.get(run_id) is not run:
                 break        # this run was cleaned up
     run["perm_pending"] = False
+    run["pending_perm"] = None   # no longer awaiting an answer (answered / torn down)
     run["last"] = time.time()
     with PENDING_LOCK:
         rec = PENDING_PERMS.pop(perm_id, None)
@@ -950,6 +958,23 @@ def record_denial(run_id, tool, tool_input, reason):
     where = f" [{target}]" if target else ""
     log_error(f"guard denied: {rec['tool']}{where} -> {rec['reason']}")
     return {"ok": True}
+
+
+def get_run_state(proj):
+    """State a reconnecting client needs to resume a turn whose stream it lost:
+      - active : is a turn still running server-side for this project?
+      - pending: the approval card currently awaiting an answer (or None)
+    Lets the UI re-show a pending confirm-mode card (so backgrounding the app while
+    an approval was waiting doesn't strand the work) and know whether to keep waiting
+    for a reply to land in the transcript."""
+    with RUNS_LOCK:
+        runs = [r for r in RUNS.values() if r.get("proj") == proj]
+    pending = None
+    for run in reversed(runs):   # newest run first (dict preserves insertion order)
+        if run.get("pending_perm"):
+            pending = run["pending_perm"]
+            break
+    return {"ok": True, "active": bool(runs), "pending": pending}
 
 
 def resolve_permission(perm_id, decision):
@@ -1554,7 +1579,9 @@ def run_claude_stream(prompt, resume=True, model=None, mode=None, inject_contrib
 
     q = queue.Queue()
     run = {"queue": q, "last": time.time(), "perm_pending": False, "timed_out": False,
-           "proc": proc, "denials": []}   # denials: detailed guard-hook block records
+           "proc": proc, "denials": [],   # denials: detailed guard-hook block records
+           "proj": proj,                  # so a reconnecting client can find this run
+           "pending_perm": None}          # the approval card awaiting an answer, if any
     with RUNS_LOCK:
         RUNS[run_id] = run
 
@@ -2008,6 +2035,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/startup/status":
             self._send_json(get_startup_status())
+            return
+        if self.path == "/api/pending":
+            # A reconnecting client (phone returning to the foreground, or a reload)
+            # asks whether a turn is still running and whether an approval card is
+            # waiting, so it can re-show the card and resume the work.
+            self._send_json(get_run_state(CONFIG["current"]))
             return
         if self.path.startswith("/api/usage"):
             q = parse_qs(urlparse(self.path).query)

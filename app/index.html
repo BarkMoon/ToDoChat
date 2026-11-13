@@ -932,20 +932,41 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 // reply to land and re-render the conversation from the authoritative transcript.
 // Returns true once restored; false if the server is unreachable (a real failure
 // the caller should surface) or nothing landed in time.
+async function restoreFromTranscript(tailNote){
+  const r = await api('/api/transcript/get', {});
+  const turns = (r && r.turns) || [];
+  log.innerHTML = ''; resetContextBar();
+  turns.forEach(t => bubble(t.text, t.role === 'user' ? 'user' : 'ai'));
+  if (tailNote) bubble(tailNote, 'sys');
+}
 async function recoverConversation(){
   const waiting = bubble('接続が切れました。応答の完成を待っています… （ホームに戻っても続行します）', 'sys');
-  for (let i = 0; i < 40; i++){
-    let turns;
+  let shownPermId = null;   // the approval card currently re-shown (avoid duplicates)
+  for (let i = 0; i < 120; i++){
+    let state;
     try {
-      const r = await api('/api/transcript/get', {});
-      turns = (r && r.turns) || [];
+      state = await api('/api/pending', null, 'GET');
     } catch (_){ waiting.remove(); return false; }   // server truly gone -> real error
-    // The server records the user turn up front and the AI reply when the turn
-    // ends; once the last entry is an AI turn, the reply has landed.
-    if (turns.length && turns[turns.length - 1].role === 'ai'){
-      log.innerHTML = ''; resetContextBar();
-      turns.forEach(t => bubble(t.text, t.role === 'user' ? 'user' : 'ai'));
-      bubble('接続が復帰し、最新の会話を再読み込みしました。この続きから入力できます。', 'sys');
+    // An approval card (confirm mode) was waiting when the stream dropped. Re-show
+    // it so the user can answer and the paused work resumes -- the decision routes
+    // back by its id regardless of which connection answers. Show each distinct
+    // request once; keep polling while it's up (don't re-render, that'd wipe it).
+    if (state && state.pending){
+      if (state.pending.id !== shownPermId){
+        if (shownPermId === null){ waiting.remove(); bubble('接続が復帰しました。保留中の確認があります。回答すると作業を続行します。', 'sys'); }
+        permissionCard(state.pending);
+        shownPermId = state.pending.id;
+      }
+      await sleep(1500);
+      continue;
+    }
+    // No approval pending and the turn is no longer running server-side: it has
+    // finished (with or without a text reply). Re-render from the authoritative
+    // transcript. The brief wait covers the tiny gap between the run ending and its
+    // reply being written.
+    if (state && !state.active){
+      await sleep(300);
+      await restoreFromTranscript('接続が復帰し、最新の会話を再読み込みしました。この続きから入力できます。');
       return true;
     }
     await sleep(1500);
@@ -1055,9 +1076,22 @@ async function init(){
     if (turns.length){
       log.innerHTML = ''; resetContextBar();
       turns.forEach(t => bubble(t.text, t.role === 'user' ? 'user' : 'ai'));
+      restored = true;
+    }
+    // A turn may still be running server-side -- e.g. the app was reloaded (or a
+    // phone returned) while a confirm-mode approval card was waiting, or a reply was
+    // mid-flight. Resume it (re-show the pending card / wait for the reply to land)
+    // instead of stranding the work.
+    let state = null;
+    try { state = await api('/api/pending', null, 'GET'); } catch (_) {}
+    if (state && (state.active || state.pending)){
+      await recoverConversation();
+      setBusy(false);
+      return;
+    }
+    if (restored){
       bubble('前回までの会話を復元しました。この続きから入力できます。', 'sys');
       bubble('最新の状況サマリーを表示するには /startup、履歴を消して新しく始めるには /new を送信してください。', 'sys');
-      restored = true;
     }
   } catch (_) { /* 履歴の取得に失敗したら通常どおり挨拶を出す */ }
   setBusy(false);
