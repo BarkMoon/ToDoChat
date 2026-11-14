@@ -43,7 +43,7 @@ for _stream in (sys.stdout, sys.stderr):
 # --- version ----------------------------------------------------------------
 # SemVer 0.x while pre-1.0 (still in active development). Bump MINOR for new
 # features / notable changes, PATCH for fixes; reserve 1.0.0 for "done enough".
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 # --- paths / config ---------------------------------------------------------
 # HOST is the local-facing address used for the in-app window and for the hook
@@ -2186,6 +2186,20 @@ class Handler(BaseHTTPRequestHandler):
             stop_server()
         else:
             self.send_error(404)
+
+    def handle_one_request(self):
+        """Wrap request handling so a client vanishing mid-response never bubbles a
+        connection error up to socketserver (which would print an alarming console
+        traceback and look like a server crash). This happens routinely: a phone
+        navigates away before we reply, or -- the case that looked like "stopping the
+        app crashed the server" -- the 終了 button's stop_server() kills a confirm-mode
+        turn whose guard-hook subprocess still has an in-flight /api/hook/* request, so
+        the handler then writes its response to a now-dead socket. Treat all of these
+        as a normal disconnect: drop the connection quietly. Mirrors _stream_ndjson."""
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            self.close_connection = True
 
     def log_message(self, *args):
         pass  # keep the console quiet
